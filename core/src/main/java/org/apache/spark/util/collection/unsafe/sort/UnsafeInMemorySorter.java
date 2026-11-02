@@ -42,6 +42,16 @@ import org.apache.spark.util.collection.Sorter;
  */
 public final class UnsafeInMemorySorter {
 
+  /**
+   * How many records ahead the sorted iterators prefetch (0 disables it). Sorted records sit at
+   * random addresses in the memory pages and would otherwise miss the cache once per record; a
+   * prefetch is kept in flight for each of the next this many records. Set with the JVM system
+   * property {@code unsafe.sort.prefetchBatch}. Always 0 when the JDK has no prefetch
+   * instructions ({@link Platform#PREFETCH_SUPPORTED}).
+   */
+  public static final int PREFETCH_BATCH =
+    Platform.PREFETCH_SUPPORTED ? Integer.getInteger("unsafe.sort.prefetchBatch", 16) : 0;
+
   private static final class SortComparator implements Comparator<RecordPointerAndKeyPrefix> {
 
     private final RecordComparator recordComparator;
@@ -272,6 +282,11 @@ public final class UnsafeInMemorySorter {
     private int recordLength;
     private long currentPageNumber;
     private final TaskContext taskContext = TaskContext.get();
+    /**
+     * Array position (like `position`) of the next record to prefetch; 0 until the first
+     * loadNext(), which prefetches the first PREFETCH_BATCH + 1 records.
+     */
+    private int prefetchPosition;
 
     private SortedIterator(int numRecords, int offset) {
       this.numRecords = numRecords;
@@ -288,6 +303,7 @@ public final class UnsafeInMemorySorter {
       iter.keyPrefix = keyPrefix;
       iter.recordLength = recordLength;
       iter.currentPageNumber = currentPageNumber;
+      iter.prefetchPosition = prefetchPosition;
       return iter;
     }
 
@@ -311,6 +327,21 @@ public final class UnsafeInMemorySorter {
       if (taskContext != null) {
         taskContext.killTaskIfInterrupted();
       }
+      // Keep a prefetch in flight for each of the next PREFETCH_BATCH records: this one and the
+      // next PREFETCH_BATCH on the first call, and then, on each call, the one PREFETCH_BATCH
+      // records after this one.
+      if (PREFETCH_BATCH > 0) {
+        if (prefetchPosition == 0) {
+          final int end = Math.min(2 * PREFETCH_BATCH + 2, 2 * numRecords);
+          for (int i = 0; i < end; i += 2) {
+            prefetchRecord(i);
+          }
+          prefetchPosition = end;
+        } else if (prefetchPosition < 2 * numRecords) {
+          prefetchRecord(prefetchPosition);
+          prefetchPosition += 2;
+        }
+      }
       // This pointer points to a 4-byte record length, followed by the record's bytes
       final long recordPointer = array.get(offset + position);
       currentPageNumber = TaskMemoryManager.decodePageNumber(recordPointer);
@@ -321,6 +352,12 @@ public final class UnsafeInMemorySorter {
       recordLength = UnsafeAlignedOffset.getSize(baseObject, baseOffset - uaoSize);
       keyPrefix = array.get(offset + position + 1);
       position += 2;
+    }
+
+    /** Prefetches the start of the record at the given array position (like `position`). */
+    private void prefetchRecord(int pos) {
+      final long p = array.get(offset + pos);
+      Platform.prefetchRead(memoryManager.getPage(p), memoryManager.getOffsetInPage(p));
     }
 
     @Override

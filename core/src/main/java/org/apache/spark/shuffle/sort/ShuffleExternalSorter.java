@@ -53,6 +53,7 @@ import org.apache.spark.unsafe.UnsafeAlignedOffset;
 import org.apache.spark.unsafe.array.LongArray;
 import org.apache.spark.unsafe.memory.MemoryBlock;
 import org.apache.spark.util.Utils;
+import org.apache.spark.util.collection.unsafe.sort.UnsafeInMemorySorter;
 
 /**
  * An external sorter that is specialized for sort-based shuffle.
@@ -226,7 +227,21 @@ final class ShuffleExternalSorter extends MemoryConsumer implements ShuffleCheck
         blockManager.getDiskWriter(blockId, file, ser, fileBufferSizeBytes, writeMetricsToUse)) {
 
       final int uaoSize = UnsafeAlignedOffset.getUaoSize();
+      // Records are read in partition order, i.e. at random addresses in the memory pages, and
+      // each one would miss the cache inside the copy loop below. Keep a prefetch in flight for
+      // each of the next prefetchBatch records: prefetch the first ones here, and then, for each
+      // record, the one prefetchBatch records after it.
+      final int prefetchBatch = UnsafeInMemorySorter.PREFETCH_BATCH;
+      if (prefetchBatch > 0) {
+        final int n = Math.min(prefetchBatch, sortedRecords.remaining());
+        for (int i = 0; i < n; i++) {
+          prefetchRecord(sortedRecords.peekPackedPointer(i));
+        }
+      }
       while (sortedRecords.hasNext()) {
+        if (prefetchBatch > 0 && sortedRecords.remaining() > prefetchBatch) {
+          prefetchRecord(sortedRecords.peekPackedPointer(prefetchBatch));
+        }
         sortedRecords.loadNext();
         final int partition = sortedRecords.packedRecordPointer.getPartitionId();
         assert (partition >= currentPartition);
@@ -292,6 +307,12 @@ final class ShuffleExternalSorter extends MemoryConsumer implements ShuffleCheck
       taskContext.taskMetrics().incDiskBytesSpilled(
         ((ShuffleWriteMetrics)writeMetricsToUse).bytesWritten());
     }
+  }
+
+  /** Prefetches the start of the record that a packed record pointer points to. */
+  private void prefetchRecord(long packedRecordPointer) {
+    final long p = PackedRecordPointer.decodeRecordPointer(packedRecordPointer);
+    Platform.prefetchRead(taskMemoryManager.getPage(p), taskMemoryManager.getOffsetInPage(p));
   }
 
   /**
