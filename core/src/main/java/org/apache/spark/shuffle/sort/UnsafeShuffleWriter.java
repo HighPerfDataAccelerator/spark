@@ -63,7 +63,6 @@ import org.apache.spark.shuffle.checksum.RowBasedChecksum;
 import org.apache.spark.storage.BlockManager;
 import org.apache.spark.storage.TimeTrackingOutputStream;
 import org.apache.spark.unsafe.Platform;
-import org.apache.spark.util.ExposedBufferByteArrayOutputStream;
 import org.apache.spark.util.Utils;
 
 @Private
@@ -95,7 +94,7 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
   @Nullable private long[] partitionLengths;
   private long peakMemoryUsedBytes = 0;
 
-  private ExposedBufferByteArrayOutputStream serBuffer;
+  private RecordBuffer serBuffer;
   private SerializationStream serOutputStream;
 
   /**
@@ -225,7 +224,7 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
       partitioner.numPartitions(),
       sparkConf,
       writeMetrics);
-    serBuffer = new ExposedBufferByteArrayOutputStream(DEFAULT_INITIAL_SER_BUFFER_SIZE);
+    serBuffer = new RecordBuffer(DEFAULT_INITIAL_SER_BUFFER_SIZE);
     serOutputStream = serializer.serializeStream(serBuffer);
   }
 
@@ -249,6 +248,56 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
     }
     mapStatus = MapStatus$.MODULE$.apply(
       blockManager.shuffleServerId(), partitionLengths, mapId, getAggregatedChecksumValue());
+  }
+
+  /**
+   * Per-record serialization buffer: an unsynchronized ByteArrayOutputStream that exposes its
+   * array. ByteArrayOutputStream's methods are synchronized, and insertRecordIntoSorter calls
+   * reset, write and size for every record; the buffer is only used by the task thread.
+   */
+  private static final class RecordBuffer extends OutputStream {
+    private byte[] buf;
+    private int count;
+
+    RecordBuffer(int size) {
+      buf = new byte[size];
+    }
+
+    private void ensureCapacity(int minCapacity) {
+      if (minCapacity < 0) {
+        throw new OutOfMemoryError("Required array size too large");
+      }
+      if (minCapacity > buf.length) {
+        long newCapacity = Math.max(2L * buf.length, minCapacity);
+        buf = Arrays.copyOf(buf, (int) Math.min(newCapacity, Integer.MAX_VALUE - 8));
+      }
+    }
+
+    @Override
+    public void write(int b) {
+      ensureCapacity(count + 1);
+      buf[count] = (byte) b;
+      count += 1;
+    }
+
+    @Override
+    public void write(byte[] b, int off, int len) {
+      ensureCapacity(count + len);
+      System.arraycopy(b, off, buf, count, len);
+      count += len;
+    }
+
+    void reset() {
+      count = 0;
+    }
+
+    int size() {
+      return count;
+    }
+
+    byte[] getBuf() {
+      return buf;
+    }
   }
 
   @VisibleForTesting

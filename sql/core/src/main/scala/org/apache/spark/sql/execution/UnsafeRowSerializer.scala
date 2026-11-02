@@ -57,8 +57,7 @@ private class UnsafeRowSerializerInstance(
    */
   override def serializeStream(out: OutputStream): SerializationStream = new SerializationStream {
     private[this] var writeBuffer: Array[Byte] = new Array[Byte](4096)
-    private[this] val dOut: DataOutputStream =
-      new DataOutputStream(new BufferedOutputStream(out))
+    private[this] val dOut: UnsafeRowDataOutputStream = new UnsafeRowDataOutputStream(out)
 
     override def writeValue[T: ClassTag](value: T): SerializationStream = {
       val row = value.asInstanceOf[UnsafeRow]
@@ -99,7 +98,7 @@ private class UnsafeRowSerializerInstance(
 
   override def deserializeStream(in: InputStream): DeserializationStream = {
     new DeserializationStream {
-      private[this] val dIn: DataInputStream = new DataInputStream(new BufferedInputStream(in))
+      private[this] val dIn: UnsafeRowDataInputStream = new UnsafeRowDataInputStream(in)
       // 1024 is a default buffer size; this buffer will grow to accommodate larger rows
       private[this] var rowBuffer: Array[Byte] = new Array[Byte](1024)
       private[this] var row: UnsafeRow = new UnsafeRow(numFields)
@@ -181,4 +180,145 @@ private class UnsafeRowSerializerInstance(
     throw SparkUnsupportedOperationException()
   override def deserialize[T: ClassTag](bytes: ByteBuffer, loader: ClassLoader): T =
     throw SparkUnsupportedOperationException()
+}
+
+/**
+ * Unsynchronized equivalent of `new DataOutputStream(new BufferedOutputStream(out))` for the
+ * per-record shuffle path: a buffered stream with a big-endian `writeInt`. The JDK classes take a
+ * lock on every call (DataOutputStream.write is synchronized; BufferedOutputStream locks an internal
+ * ReentrantLock since JDK 19), several times per record. A serialization stream is only used by
+ * the task thread that created it.
+ */
+private[execution] final class UnsafeRowDataOutputStream(out: OutputStream) extends OutputStream {
+  private[this] val buf = new Array[Byte](8192)
+  private[this] var count = 0
+  private[this] var closed = false
+
+  private[this] def flushBuffer(): Unit = {
+    if (count > 0) {
+      out.write(buf, 0, count)
+      count = 0
+    }
+  }
+
+  override def write(b: Int): Unit = {
+    if (count >= buf.length) flushBuffer()
+    buf(count) = b.toByte
+    count += 1
+  }
+
+  override def write(b: Array[Byte], off: Int, len: Int): Unit = {
+    if (len >= buf.length) {
+      flushBuffer()
+      out.write(b, off, len)
+    } else {
+      if (len > buf.length - count) flushBuffer()
+      System.arraycopy(b, off, buf, count, len)
+      count += len
+    }
+  }
+
+  /** Writes `v` high byte first, as DataOutputStream.writeInt. */
+  def writeInt(v: Int): Unit = {
+    if (buf.length - count < 4) flushBuffer()
+    buf(count) = (v >>> 24).toByte
+    buf(count + 1) = (v >>> 16).toByte
+    buf(count + 2) = (v >>> 8).toByte
+    buf(count + 3) = v.toByte
+    count += 4
+  }
+
+  override def flush(): Unit = {
+    flushBuffer()
+    out.flush()
+  }
+
+  override def close(): Unit = {
+    if (!closed) {
+      closed = true
+      try flush() finally out.close()
+    }
+  }
+}
+
+/**
+ * Unsynchronized equivalent of `new DataInputStream(new BufferedInputStream(in))` for the
+ * per-record shuffle path: a buffered stream with a big-endian `readInt`. See
+ * [[UnsafeRowDataOutputStream]]; BufferedInputStream locks an internal ReentrantLock on every call
+ * since JDK 19.
+ */
+private[execution] final class UnsafeRowDataInputStream(private[this] var in: InputStream)
+  extends InputStream {
+  private[this] var buf = new Array[Byte](8192)
+  private[this] var pos = 0
+  private[this] var limit = 0
+
+  /** Refills the buffer; returns false at end of stream. */
+  private[this] def fill(): Boolean = {
+    var n = 0
+    while (n == 0) {
+      n = in.read(buf, 0, buf.length)
+    }
+    pos = 0
+    limit = math.max(n, 0)
+    n > 0
+  }
+
+  override def read(): Int = {
+    if (pos >= limit && !fill()) {
+      -1
+    } else {
+      val b = buf(pos) & 0xff
+      pos += 1
+      b
+    }
+  }
+
+  override def read(b: Array[Byte], off: Int, len: Int): Int = {
+    if (len == 0) {
+      0
+    } else if (pos < limit) {
+      val n = math.min(limit - pos, len)
+      System.arraycopy(buf, pos, b, off, n)
+      pos += n
+      n
+    } else if (len >= buf.length) {
+      in.read(b, off, len)
+    } else if (!fill()) {
+      -1
+    } else {
+      val n = math.min(limit, len)
+      System.arraycopy(buf, 0, b, off, n)
+      pos = n
+      n
+    }
+  }
+
+  /** Reads an int written high byte first, as DataInputStream.readInt. */
+  def readInt(): Int = {
+    if (limit - pos >= 4) {
+      val v = ((buf(pos) & 0xff) << 24) | ((buf(pos + 1) & 0xff) << 16) |
+        ((buf(pos + 2) & 0xff) << 8) | (buf(pos + 3) & 0xff)
+      pos += 4
+      v
+    } else {
+      val b1 = read()
+      val b2 = read()
+      val b3 = read()
+      val b4 = read()
+      if ((b1 | b2 | b3 | b4) < 0) throw new EOFException()
+      (b1 << 24) | (b2 << 16) | (b3 << 8) | b4
+    }
+  }
+
+  override def available(): Int = limit - pos + in.available()
+
+  override def close(): Unit = {
+    if (in != null) {
+      val i = in
+      in = null
+      buf = null
+      i.close()
+    }
+  }
 }
