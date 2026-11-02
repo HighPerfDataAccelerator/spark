@@ -17,6 +17,9 @@
 
 package org.apache.spark.unsafe;
 
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
@@ -118,6 +121,43 @@ public final class Platform {
    */
   public static boolean unaligned() {
     return unaligned;
+  }
+
+  /**
+   * Whether the JVM provides real prefetch instructions through sun.misc.Unsafe
+   * (prefetchReadStatic / prefetchWriteStatic, available only in patched JDKs). When false,
+   * {@link #prefetchRead} and {@link #prefetchWrite} do nothing and callers that need the memory
+   * in cache have to touch it with loads instead. Set the JVM system property
+   * {@code unsafe.prefetch.jdk} to false to ignore the JDK methods even when they exist.
+   */
+  public static final boolean PREFETCH_SUPPORTED;
+
+  // Constant (static final) method handles, so that C2 inlines them down to the Unsafe intrinsic.
+  private static final MethodHandle PREFETCH_READ;
+  private static final MethodHandle PREFETCH_WRITE;
+
+  /**
+   * Hints the CPU to bring the cache line at the given address into the cache for reading. Never
+   * faults, whatever the address. A no-op when {@link #PREFETCH_SUPPORTED} is false.
+   */
+  public static void prefetchRead(Object object, long offset) {
+    try {
+      PREFETCH_READ.invokeExact(object, offset);
+    } catch (Throwable t) {
+      throw new IllegalStateException(t);
+    }
+  }
+
+  /**
+   * Hints the CPU to bring the cache line at the given address into the cache for writing. Never
+   * faults, whatever the address. A no-op when {@link #PREFETCH_SUPPORTED} is false.
+   */
+  public static void prefetchWrite(Object object, long offset) {
+    try {
+      PREFETCH_WRITE.invokeExact(object, offset);
+    } catch (Throwable t) {
+      throw new IllegalStateException(t);
+    }
   }
 
   public static int getInt(Object object, long offset) {
@@ -354,5 +394,25 @@ public final class Platform {
       }
     }
     unaligned = _unaligned;
+  }
+
+  static {
+    final MethodType type = MethodType.methodType(void.class, Object.class, long.class);
+    MethodHandle read = null;
+    MethodHandle write = null;
+    if (_UNSAFE != null && !"false".equals(System.getProperty("unsafe.prefetch.jdk"))) {
+      try {
+        MethodHandles.Lookup lookup = MethodHandles.publicLookup();
+        read = lookup.findStatic(Unsafe.class, "prefetchReadStatic", type);
+        write = lookup.findStatic(Unsafe.class, "prefetchWriteStatic", type);
+      } catch (Throwable t) {
+        // Stock JDK: no prefetch methods.
+        read = null;
+        write = null;
+      }
+    }
+    PREFETCH_SUPPORTED = read != null && write != null;
+    PREFETCH_READ = PREFETCH_SUPPORTED ? read : MethodHandles.empty(type);
+    PREFETCH_WRITE = PREFETCH_SUPPORTED ? write : MethodHandles.empty(type);
   }
 }

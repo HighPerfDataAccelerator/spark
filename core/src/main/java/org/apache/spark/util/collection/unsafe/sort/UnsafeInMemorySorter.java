@@ -42,6 +42,16 @@ import org.apache.spark.util.collection.Sorter;
  */
 public final class UnsafeInMemorySorter {
 
+  /**
+   * How many records the sorted iterators fetch ahead (0 disables it). Sorted records sit at
+   * random addresses in the memory pages and would otherwise miss the cache once per record.
+   * When the JDK has prefetch instructions ({@link Platform#PREFETCH_SUPPORTED}), a prefetch is
+   * kept in flight for each of the next this many records; otherwise the lengths of the next
+   * this many records are read back to back once per batch, so that their misses overlap. Set
+   * with the JVM system property {@code unsafe.sort.prefetchBatch}.
+   */
+  public static final int PREFETCH_BATCH = Integer.getInteger("unsafe.sort.prefetchBatch", 16);
+
   private static final class SortComparator implements Comparator<RecordPointerAndKeyPrefix> {
 
     private final RecordComparator recordComparator;
@@ -272,6 +282,11 @@ public final class UnsafeInMemorySorter {
     private int recordLength;
     private long currentPageNumber;
     private final TaskContext taskContext = TaskContext.get();
+    private int untilPrefetch;
+    /** Array position (like `position`) of the next record to prefetch. */
+    private int prefetchPosition;
+    /** Sum of the prefetched record lengths, kept so that the JIT cannot drop the loads. */
+    private long prefetchSink;
 
     private SortedIterator(int numRecords, int offset) {
       this.numRecords = numRecords;
@@ -310,6 +325,29 @@ public final class UnsafeInMemorySorter {
       // `getNumRecords()` instead of `hasNext()` to know when to stop.
       if (taskContext != null) {
         taskContext.killTaskIfInterrupted();
+      }
+      if (PREFETCH_BATCH > 0) {
+        if (Platform.PREFETCH_SUPPORTED) {
+          // Keep a prefetch in flight for each of the next PREFETCH_BATCH records.
+          final int end = Math.min(position + 2 * PREFETCH_BATCH, 2 * numRecords);
+          int i = Math.max(prefetchPosition, position);
+          while (i < end) {
+            final long p = array.get(offset + i);
+            Platform.prefetchRead(memoryManager.getPage(p), memoryManager.getOffsetInPage(p));
+            i += 2;
+          }
+          prefetchPosition = i;
+        } else if (--untilPrefetch <= 0) {
+          final int n = Math.min(PREFETCH_BATCH, numRecords - position / 2);
+          long sum = 0;
+          for (int i = 0; i < n; i++) {
+            final long p = array.get(offset + position + 2 * i);
+            sum += UnsafeAlignedOffset.getSize(
+              memoryManager.getPage(p), memoryManager.getOffsetInPage(p));
+          }
+          prefetchSink += sum;
+          untilPrefetch = n;
+        }
       }
       // This pointer points to a 4-byte record length, followed by the record's bytes
       final long recordPointer = array.get(offset + position);
