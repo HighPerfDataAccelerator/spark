@@ -53,6 +53,7 @@ import org.apache.spark.unsafe.UnsafeAlignedOffset;
 import org.apache.spark.unsafe.array.LongArray;
 import org.apache.spark.unsafe.memory.MemoryBlock;
 import org.apache.spark.util.Utils;
+import org.apache.spark.util.collection.unsafe.sort.UnsafeInMemorySorter;
 
 /**
  * An external sorter that is specialized for sort-based shuffle.
@@ -112,6 +113,9 @@ final class ShuffleExternalSorter extends MemoryConsumer implements ShuffleCheck
 
   /** Peak memory used by this sorter so far, in bytes. **/
   private long peakMemoryUsedBytes;
+
+  /** Sum of the prefetched record lengths, kept so that the JIT cannot drop the prefetch loads. */
+  private long prefetchSink;
 
   // These variables are reset after spilling:
   @Nullable private ShuffleInMemorySorter inMemSorter;
@@ -226,7 +230,23 @@ final class ShuffleExternalSorter extends MemoryConsumer implements ShuffleCheck
         blockManager.getDiskWriter(blockId, file, ser, fileBufferSizeBytes, writeMetricsToUse)) {
 
       final int uaoSize = UnsafeAlignedOffset.getUaoSize();
+      final int prefetchBatch = UnsafeInMemorySorter.PREFETCH_BATCH;
+      int untilPrefetch = 0;
+      long prefetched = 0;
       while (sortedRecords.hasNext()) {
+        if (prefetchBatch > 0 && --untilPrefetch <= 0) {
+          // Records are read in partition order, i.e. at random addresses in the memory pages.
+          // Touch the next batch's record lengths back to back so that their cache misses
+          // overlap, instead of missing once per record inside the copy loop below.
+          final int n = Math.min(prefetchBatch, sortedRecords.remaining());
+          for (int i = 0; i < n; i++) {
+            final long p =
+              PackedRecordPointer.decodeRecordPointer(sortedRecords.peekPackedPointer(i));
+            prefetched += UnsafeAlignedOffset.getSize(
+              taskMemoryManager.getPage(p), taskMemoryManager.getOffsetInPage(p));
+          }
+          untilPrefetch = n;
+        }
         sortedRecords.loadNext();
         final int partition = sortedRecords.packedRecordPointer.getPartitionId();
         assert (partition >= currentPartition);
@@ -257,6 +277,7 @@ final class ShuffleExternalSorter extends MemoryConsumer implements ShuffleCheck
         }
         writer.recordWritten();
       }
+      prefetchSink += prefetched;
 
       committedSegment = writer.commitAndGet();
     }

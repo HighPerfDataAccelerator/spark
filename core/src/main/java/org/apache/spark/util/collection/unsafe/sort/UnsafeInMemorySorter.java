@@ -42,6 +42,14 @@ import org.apache.spark.util.collection.Sorter;
  */
 public final class UnsafeInMemorySorter {
 
+  /**
+   * Number of records whose lengths the sorted iterators read ahead in one go (0 disables it).
+   * Sorted records sit at random addresses in the memory pages; reading a batch of them back to
+   * back lets their cache misses overlap instead of missing once per record. Set with the JVM
+   * system property {@code unsafe.sort.prefetchBatch}.
+   */
+  public static final int PREFETCH_BATCH = Integer.getInteger("unsafe.sort.prefetchBatch", 16);
+
   private static final class SortComparator implements Comparator<RecordPointerAndKeyPrefix> {
 
     private final RecordComparator recordComparator;
@@ -272,6 +280,9 @@ public final class UnsafeInMemorySorter {
     private int recordLength;
     private long currentPageNumber;
     private final TaskContext taskContext = TaskContext.get();
+    private int untilPrefetch;
+    /** Sum of the prefetched record lengths, kept so that the JIT cannot drop the loads. */
+    private long prefetchSink;
 
     private SortedIterator(int numRecords, int offset) {
       this.numRecords = numRecords;
@@ -310,6 +321,17 @@ public final class UnsafeInMemorySorter {
       // `getNumRecords()` instead of `hasNext()` to know when to stop.
       if (taskContext != null) {
         taskContext.killTaskIfInterrupted();
+      }
+      if (PREFETCH_BATCH > 0 && --untilPrefetch <= 0) {
+        final int n = Math.min(PREFETCH_BATCH, numRecords - position / 2);
+        long sum = 0;
+        for (int i = 0; i < n; i++) {
+          final long p = array.get(offset + position + 2 * i);
+          sum += UnsafeAlignedOffset.getSize(
+            memoryManager.getPage(p), memoryManager.getOffsetInPage(p));
+        }
+        prefetchSink += sum;
+        untilPrefetch = n;
       }
       // This pointer points to a 4-byte record length, followed by the record's bytes
       final long recordPointer = array.get(offset + position);

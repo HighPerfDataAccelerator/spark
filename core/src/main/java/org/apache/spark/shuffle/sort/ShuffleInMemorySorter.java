@@ -194,6 +194,16 @@ final class ShuffleInMemorySorter {
       packedRecordPointer.set(pointerArray.get(position));
       position++;
     }
+
+    /** Number of records that loadNext() has not returned yet. */
+    int remaining() {
+      return limit - position;
+    }
+
+    /** Packed pointer of the i-th record that loadNext() will return next (i < remaining()). */
+    long peekPackedPointer(int i) {
+      return pointerArray.get(position + i);
+    }
   }
 
   /**

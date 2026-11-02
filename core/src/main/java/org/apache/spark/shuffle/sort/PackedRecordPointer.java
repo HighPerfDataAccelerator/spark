@@ -94,6 +94,13 @@ final class PackedRecordPointer {
   }
 
   public long getRecordPointer() {
+    return decodeRecordPointer(packedRecordPointer);
+  }
+
+  /**
+   * Decode the record address (as encoded by TaskMemoryManager) from a packed pointer.
+   */
+  public static long decodeRecordPointer(long packedRecordPointer) {
     final long pageNumber = (packedRecordPointer << 24) & MASK_LONG_UPPER_13_BITS;
     final long offsetInPage = packedRecordPointer & MASK_LONG_LOWER_27_BITS;
     return pageNumber | offsetInPage;
