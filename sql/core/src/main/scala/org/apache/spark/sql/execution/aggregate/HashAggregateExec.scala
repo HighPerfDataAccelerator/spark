@@ -155,6 +155,18 @@ case class HashAggregateExec(
   private var hashMapTerm: String = _
   private var sorterTerm: String = _
 
+  // Rows that go to the regular hash map are collected in batches of this size (copies of the
+  // grouping key and of the input columns the aggregate functions read). Each full batch first
+  // touches the hash map memory of all its keys, so that their cache misses overlap, and then
+  // looks up and updates the keys in input order. 0 disables batching.
+  private lazy val prefetchBatch =
+    conf.getConfString("spark.sql.codegen.aggregate.prefetchBatch", "16").toInt
+  // Batching starts once the regular hash map holds this many keys; a smaller map stays in cache.
+  private lazy val prefetchMinKeys =
+    conf.getConfString("spark.sql.codegen.aggregate.prefetchMinKeys", "16384").toInt
+  // Code that processes the rows still in a batch, run after the child's last row.
+  private var flushPrefetchBatches: String = ""
+
   /**
    * This is called by generated Java class, should be public.
    */
@@ -426,6 +438,7 @@ case class HashAggregateExec(
   protected override def needHashTable: Boolean = true
 
   protected override def doProduceWithKeys(ctx: CodegenContext): String = {
+    flushPrefetchBatches = ""  // set by doConsumeWithKeys during the child's produce below
     val initAgg = ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "initAgg")
     if (conf.enableTwoLevelAggMap) {
       enableTwoLevelHashMap()
@@ -536,6 +549,7 @@ case class HashAggregateExec(
       s"""
          |private void $doAgg(int partitionIndex) throws java.io.IOException {
          |  ${child.asInstanceOf[CodegenSupport].produce(ctx, this)}
+         |  $flushPrefetchBatches
          |  $finishHashMap
          |}
        """.stripMargin)
@@ -662,15 +676,17 @@ case class HashAggregateExec(
 
     val oomeClassName = classOf[SparkOutOfMemoryError].getName
 
-    val findOrInsertRegularHashMap: String =
+    // Batch the regular hash map lookups (see `prefetchBatch`). Not for the vectorized fast hash
+    // map (testing only) or the controlled-fallback tests.
+    val batchLookups = prefetchBatch > 0 && !isVectorizedHashMapEnabled &&
+      testFallbackStartsAt.isEmpty
+
+    def lookupRegularHashMap(keyTerm: String, hashTerm: String): String =
       s"""
-         |// generate grouping key
-         |${unsafeRowKeyCode.code}
-         |int $unsafeRowKeyHash = ${unsafeRowKeyCode.value}.hashCode();
          |if ($checkFallbackForBytesToBytesMap) {
          |  // try to get the buffer from hash map
          |  $unsafeRowBuffer =
-         |    $hashMapTerm.getAggregationBufferFromUnsafeRow($unsafeRowKeys, $unsafeRowKeyHash);
+         |    $hashMapTerm.getAggregationBufferFromUnsafeRow($keyTerm, $hashTerm);
          |}
          |// Can't allocate buffer from the hash map. Spill the map and fallback to sort-based
          |// aggregation after processing all input rows.
@@ -684,12 +700,20 @@ case class HashAggregateExec(
          |  // the hash map had be spilled, it should have enough memory now,
          |  // try to allocate buffer again.
          |  $unsafeRowBuffer = $hashMapTerm.getAggregationBufferFromUnsafeRow(
-         |    $unsafeRowKeys, $unsafeRowKeyHash);
+         |    $keyTerm, $hashTerm);
          |  if ($unsafeRowBuffer == null) {
          |    // failed to allocate the first page
          |    throw new $oomeClassName("AGGREGATE_OUT_OF_MEMORY", new java.util.HashMap());
          |  }
          |}
+       """.stripMargin
+
+    val findOrInsertRegularHashMap: String =
+      s"""
+         |// generate grouping key
+         |${unsafeRowKeyCode.code}
+         |int $unsafeRowKeyHash = ${unsafeRowKeyCode.value}.hashCode();
+         |${lookupRegularHashMap(unsafeRowKeys, unsafeRowKeyHash)}
        """.stripMargin
 
     val findOrInsertHashMap: String = {
@@ -732,7 +756,10 @@ case class HashAggregateExec(
       offsets.toArray
     }
 
-    val updateRowInRegularHashMap: String = {
+    // `inputVars` are the input columns: `input`, or the columns read back from a batch.
+    def updateRegularHashMapRow(inputVars: Seq[ExprCode]): String = {
+      ctx.currentVars = (new Array[ExprCode](aggregateBufferAttributes.length) ++ inputVars)
+        .toImmutableArraySeq
       ctx.INPUT_ROW = unsafeRowBuffer
       val boundUpdateExprs = updateExprs.map { updateExprsForOneFunc =>
         bindReferences(updateExprsForOneFunc, inputAttrs)
@@ -767,7 +794,7 @@ case class HashAggregateExec(
       }
 
       val codeToEvalAggFuncs = generateEvalCodeForAggFuncs(
-        ctx, input, inputAttrs, boundUpdateExprs, aggNames, aggCodeBlocks, subExprs)
+        ctx, inputVars, inputAttrs, boundUpdateExprs, aggNames, aggCodeBlocks, subExprs)
       s"""
          |// common sub-expressions
          |$effectiveCodes
@@ -776,7 +803,9 @@ case class HashAggregateExec(
        """.stripMargin
     }
 
-    val updateRowInHashMap: String = {
+    lazy val updateRowInRegularHashMap: String = updateRegularHashMapRow(input)
+
+    lazy val updateRowInHashMap: String = {
       if (isFastHashMapEnabled) {
         if (isVectorizedHashMapEnabled) {
           ctx.INPUT_ROW = fastRowBuffer
@@ -862,12 +891,134 @@ case class HashAggregateExec(
     // hash map will return null for new key), we spill the hash map to disk to free memory, then
     // continue to do in-memory aggregation and spilling until all the rows had been processed.
     // Finally, sort the spilled aggregate buffers by key, and merge them together for same key.
-    s"""
-       |$declareRowBuffer
-       |$findOrInsertHashMap
-       |$incCounter
-       |$updateRowInHashMap
-     """.stripMargin
+    if (!batchLookups) {
+      s"""
+         |$declareRowBuffer
+         |$findOrInsertHashMap
+         |$incCounter
+         |$updateRowInHashMap
+       """.stripMargin
+    } else {
+      // Batched regular hash map lookups. A row that misses the fast hash map is queued with a
+      // copy of its grouping key and of the input columns read by the aggregate functions (and
+      // their FILTERs). Rows of one key are still applied in input order: a key is either in the
+      // fast hash map or never, and queued rows are processed in order.
+      val refs = AttributeSet(updateExprs.flatten ++ aggregateExpressions.flatMap(_.filter))
+      val queued = inputAttributes.indices.filter(i => refs.contains(inputAttributes(i)))
+      ctx.currentVars = input
+      ctx.INPUT_ROW = null
+      val queuedInputCode = GenerateUnsafeProjection.createCode(ctx,
+        queued.map(i => BoundReference(i, inputAttributes(i).dataType, inputAttributes(i).nullable)))
+
+      val n = prefetchBatch
+      val keyBatch = ctx.addMutableState("UnsafeRow[]", "aggKeyBatch", v =>
+        s"""
+           |$v = new UnsafeRow[$n];
+           |for (int i = 0; i < $n; i++) {
+           |  $v[i] = UnsafeRow.createFromByteArray(64, ${groupingExpressions.length});
+           |}
+         """.stripMargin, forceInline = true)
+      val inputBatch = ctx.addMutableState("UnsafeRow[]", "aggInputBatch", v =>
+        s"""
+           |$v = new UnsafeRow[$n];
+           |for (int i = 0; i < $n; i++) {
+           |  $v[i] = UnsafeRow.createFromByteArray(64, ${queued.length});
+           |}
+         """.stripMargin, forceInline = true)
+      val hashBatch = ctx.addMutableState("int[]", "aggHashBatch", v => s"$v = new int[$n];",
+        forceInline = true)
+      val batchSize = ctx.addMutableState(CodeGenerator.JAVA_INT, "aggBatchSize",
+        forceInline = true)
+
+      // The flush function reads the queued columns back as the aggregate functions' input.
+      val i = ctx.freshName("i")
+      val key = ctx.freshName("batchKey")
+      val hash = ctx.freshName("batchHash")
+      val queuedRow = ctx.freshName("batchInput")
+      val queuedPos = queued.zipWithIndex.toMap
+      val readQueued = mutable.ArrayBuffer[String]()
+      val queuedVars = inputAttributes.indices.map { j =>
+        val dt = inputAttributes(j).dataType
+        queuedPos.get(j) match {
+          case Some(k) =>
+            val isNull = ctx.freshName("batchInputIsNull")
+            val value = ctx.freshName("batchInputValue")
+            readQueued +=
+              s"""
+                 |boolean $isNull = $queuedRow.isNullAt($k);
+                 |${CodeGenerator.javaType(dt)} $value = $isNull ?
+                 |  ${CodeGenerator.defaultValue(dt)} : ${CodeGenerator.getValue(queuedRow, dt, k.toString)};
+               """.stripMargin
+            ExprCode(JavaCode.isNullVariable(isNull), JavaCode.variable(value, dt))
+          case None =>
+            // Not read by any aggregate function.
+            ExprCode(codegen.TrueLiteral, JavaCode.defaultLiteral(dt))
+        }
+      }
+      val updateQueuedRow = updateRegularHashMapRow(queuedVars)
+      val flushName = ctx.freshName("flushAggBatch")
+      val flush = ctx.addNewFunction(flushName,
+        s"""
+           |private void $flushName() throws java.io.IOException {
+           |  $hashMapTerm.prefetch($hashBatch, $batchSize);
+           |  for (int $i = 0; $i < $batchSize; $i++) {
+           |    UnsafeRow $key = $keyBatch[$i];
+           |    int $hash = $hashBatch[$i];
+           |    UnsafeRow $queuedRow = $inputBatch[$i];
+           |    UnsafeRow $unsafeRowBuffer = null;
+           |    ${lookupRegularHashMap(key, hash)}
+           |    ${readQueued.mkString("\n")}
+           |    $updateQueuedRow
+           |  }
+           |  $batchSize = 0;
+           |}
+         """.stripMargin)
+      flushPrefetchBatches += s"if ($batchSize > 0) $flush();\n"
+
+      // While the map has fewer than `prefetchMinKeys` keys it stays in cache: rows are looked up
+      // directly, as without batching, but only when no row is queued, to keep the input order.
+      val enqueueOrLookup =
+        s"""
+           |// generate grouping key
+           |${unsafeRowKeyCode.code}
+           |if ($batchSize == 0 && $hashMapTerm.getNumKeys() < $prefetchMinKeys) {
+           |  int $unsafeRowKeyHash = ${unsafeRowKeyCode.value}.hashCode();
+           |  ${lookupRegularHashMap(unsafeRowKeys, unsafeRowKeyHash)}
+           |} else {
+           |  ${queuedInputCode.code}
+           |  $keyBatch[$batchSize].copyFrom($unsafeRowKeys);
+           |  $inputBatch[$batchSize].copyFrom(${queuedInputCode.value});
+           |  $hashBatch[$batchSize] = $unsafeRowKeys.hashCode();
+           |  if (++$batchSize == $n) {
+           |    $flush();
+           |  }
+           |}
+         """.stripMargin
+      val findOrEnqueue = if (isFastHashMapEnabled) {
+        s"""
+           |${fastRowKeys.map(_.code).mkString("\n")}
+           |if (${fastRowKeys.map("!" + _.isNull).mkString(" && ")}) {
+           |  $fastRowBuffer = $fastHashMapTerm.findOrInsert(
+           |    ${fastRowKeys.map(_.value).mkString(", ")});
+           |}
+           |if ($fastRowBuffer != null) {
+           |  $unsafeRowBuffer = $fastRowBuffer;
+           |} else {
+           |  $enqueueOrLookup
+           |}
+         """.stripMargin
+      } else {
+        enqueueOrLookup
+      }
+      // `unsafeRowBuffer` is null if the row was queued.
+      s"""
+         |$declareRowBuffer
+         |$findOrEnqueue
+         |if ($unsafeRowBuffer != null) {
+         |  $updateRowInRegularHashMap
+         |}
+       """.stripMargin
+    }
   }
 
   override def verboseString(maxFields: Int): String = toString(verbose = true, maxFields)

@@ -515,6 +515,39 @@ public final class BytesToBytesMap extends MemoryConsumer {
     return loc;
   }
 
+  // Addresses read from the buckets by prefetch(), and a sink for the loaded values so that the
+  // JIT cannot drop the loads.
+  private long[] prefetchAddresses = new long[0];
+  private long prefetchSink;
+
+  /**
+   * Touches the memory that lookups of the given hashes will read, so that the cache misses of a
+   * batch of lookups overlap instead of being paid one after another: first the first-probe
+   * bucket of every hash, then the record that bucket points to. Lookups that probe further, or
+   * whose keys differ, still work; they just miss as before. Does nothing after the map is freed.
+   */
+  public void prefetch(int[] hashes, int count) {
+    if (longArray == null) {
+      return;
+    }
+    if (prefetchAddresses.length < count) {
+      prefetchAddresses = new long[count];
+    }
+    final long[] addresses = prefetchAddresses;
+    for (int i = 0; i < count; i++) {
+      addresses[i] = longArray.get((hashes[i] & mask) * 2);
+    }
+    long sink = 0;
+    for (int i = 0; i < count; i++) {
+      final long address = addresses[i];
+      if (address != 0) {
+        sink += Platform.getInt(
+          taskMemoryManager.getPage(address), taskMemoryManager.getOffsetInPage(address));
+      }
+    }
+    prefetchSink += sink;
+  }
+
   /**
    * Looks up a key, and saves the result in provided `loc`.
    *
