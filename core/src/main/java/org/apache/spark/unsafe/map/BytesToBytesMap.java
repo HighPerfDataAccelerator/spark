@@ -516,6 +516,68 @@ public final class BytesToBytesMap extends MemoryConsumer {
   }
 
   /**
+   * Number of 64-byte cache lines of a record that {@link #prefetch} fetches, from the record's
+   * start (JVM system property {@code unsafe.map.prefetchLines}, default 2). A record is its
+   * lengths, the key and then the value, and is not line-aligned, so the value that an aggregate
+   * updates often starts in the record's second line.
+   */
+  private static final int PREFETCH_RECORD_LINES =
+    Math.max(1, Integer.getInteger("unsafe.map.prefetchLines", 2));
+
+  /**
+   * Whether {@link #prefetch} fetches the records for writing (JVM system property
+   * {@code unsafe.map.prefetchWrite}, default false), as callers that update the values in place
+   * (aggregates) will.
+   */
+  private static final boolean PREFETCH_RECORD_FOR_WRITE =
+    Boolean.getBoolean("unsafe.map.prefetchWrite");
+
+  /**
+   * Prefetches the first-probe bucket of a key hash, for a lookup that comes later: callers
+   * issue it as soon as the hash is known (e.g. when a row is queued), so that the bucket arrives
+   * while they do other work, and then call {@link #prefetch} before the lookups. The map may
+   * grow in between; the prefetch is then wasted, never wrong. Does nothing when the JDK has no
+   * prefetch instructions ({@link Platform#PREFETCH_SUPPORTED}) or after the map is freed.
+   */
+  public void prefetchBucket(int hash) {
+    if (Platform.PREFETCH_SUPPORTED && longArray != null) {
+      // Each bucket is two longs (record address, full hash), i.e. 16 bytes at index pos * 2.
+      Platform.prefetchRead(
+        longArray.getBaseObject(), longArray.getBaseOffset() + ((long) (hash & mask) << 4));
+    }
+  }
+
+  /**
+   * Prefetches the records that lookups of the given hashes will read first, i.e. the records
+   * their first-probe buckets point to (their first {@code unsafe.map.prefetchLines} cache lines,
+   * for reading or, with {@code unsafe.map.prefetchWrite}, for writing), so that the cache misses of a batch of lookups overlap
+   * instead of being paid one after another. The buckets are read here, so they should have been
+   * prefetched earlier with {@link #prefetchBucket}. Lookups that probe further, or whose keys
+   * differ, still work; they just miss as before. Does nothing when the JDK has no prefetch
+   * instructions ({@link Platform#PREFETCH_SUPPORTED}) or after the map is freed.
+   */
+  public void prefetch(int[] hashes, int count) {
+    if (!Platform.PREFETCH_SUPPORTED || longArray == null) {
+      return;
+    }
+    // The bucket loads do not depend on each other, so their misses (if any) overlap.
+    for (int i = 0; i < count; i++) {
+      final long address = longArray.get((hashes[i] & mask) * 2);
+      if (address != 0) {
+        final Object page = taskMemoryManager.getPage(address);
+        final long offsetInPage = taskMemoryManager.getOffsetInPage(address);
+        for (int line = 0; line < PREFETCH_RECORD_LINES; line++) {
+          if (PREFETCH_RECORD_FOR_WRITE) {
+            Platform.prefetchWrite(page, offsetInPage + 64L * line);
+          } else {
+            Platform.prefetchRead(page, offsetInPage + 64L * line);
+          }
+        }
+      }
+    }
+  }
+
+  /**
    * Looks up a key, and saves the result in provided `loc`.
    *
    * This is a thread-safe version of `lookup`, could be used by multiple threads.
