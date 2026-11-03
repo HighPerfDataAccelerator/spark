@@ -122,6 +122,21 @@ public final class UnsafeFixedWidthAggregationMap {
     return getAggregationBufferFromUnsafeRow(key, key.hashCode());
   }
 
+  /**
+   * Touches the hash map memory that the next lookups of these key hashes will read (see
+   * {@link BytesToBytesMap#prefetch}). Called by generated code before a batch of lookups.
+   */
+  public void prefetch(int[] hashes, int count) {
+    map.prefetch(hashes, count);
+  }
+
+  /**
+   * Returns the number of keys in the map.
+   */
+  public int getNumKeys() {
+    return map.numKeys();
+  }
+
   public UnsafeRow getAggregationBufferFromUnsafeRow(UnsafeRow key, int hash) {
     // Probe our map using the serialized key
     final BytesToBytesMap.Location loc = map.lookup(

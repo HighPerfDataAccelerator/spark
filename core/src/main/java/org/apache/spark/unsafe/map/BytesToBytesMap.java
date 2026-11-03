@@ -515,6 +515,58 @@ public final class BytesToBytesMap extends MemoryConsumer {
     return loc;
   }
 
+  // Addresses read from the buckets by prefetch(), and a sink for the loaded values so that the
+  // JIT cannot drop the loads.
+  private long[] prefetchAddresses = new long[0];
+  private long prefetchSink;
+
+  /**
+   * Brings the memory that lookups of the given hashes will read into the cache, so that the
+   * cache misses of a batch of lookups overlap instead of being paid one after another: first
+   * the first-probe bucket of every hash, then the record that bucket points to. Lookups that
+   * probe further, or whose keys differ, still work; they just miss as before. Uses prefetch
+   * instructions when the JDK has them ({@link Platform#PREFETCH_SUPPORTED}), and loads
+   * otherwise. Does nothing after the map is freed.
+   */
+  public void prefetch(int[] hashes, int count) {
+    if (longArray == null) {
+      return;
+    }
+    if (Platform.PREFETCH_SUPPORTED) {
+      final Object bucketsBase = longArray.getBaseObject();
+      final long bucketsOffset = longArray.getBaseOffset();
+      // Each bucket is two longs (record address, full hash), i.e. 16 bytes at index pos * 2.
+      for (int i = 0; i < count; i++) {
+        Platform.prefetchRead(bucketsBase, bucketsOffset + ((long) (hashes[i] & mask) << 4));
+      }
+      // These loads hit the lines prefetched above; they do not wait for each other.
+      for (int i = 0; i < count; i++) {
+        final long address = longArray.get((hashes[i] & mask) * 2);
+        if (address != 0) {
+          Platform.prefetchRead(
+            taskMemoryManager.getPage(address), taskMemoryManager.getOffsetInPage(address));
+        }
+      }
+      return;
+    }
+    if (prefetchAddresses.length < count) {
+      prefetchAddresses = new long[count];
+    }
+    final long[] addresses = prefetchAddresses;
+    for (int i = 0; i < count; i++) {
+      addresses[i] = longArray.get((hashes[i] & mask) * 2);
+    }
+    long sink = 0;
+    for (int i = 0; i < count; i++) {
+      final long address = addresses[i];
+      if (address != 0) {
+        sink += Platform.getInt(
+          taskMemoryManager.getPage(address), taskMemoryManager.getOffsetInPage(address));
+      }
+    }
+    prefetchSink += sink;
+  }
+
   /**
    * Looks up a key, and saves the result in provided `loc`.
    *
