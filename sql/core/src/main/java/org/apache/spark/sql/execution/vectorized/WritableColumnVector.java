@@ -951,6 +951,7 @@ public abstract class WritableColumnVector extends ColumnVector {
    */
   public final void setMissing() {
     isMissing = true;
+    allNull = true;
   }
 
   /**
@@ -964,7 +965,7 @@ public abstract class WritableColumnVector extends ColumnVector {
    * Whether this column only contains null values.
    */
   public final boolean isAllNull() {
-    return isMissing || type instanceof NullType;
+    return allNull;
   }
 
   /**
@@ -1003,6 +1004,12 @@ public abstract class WritableColumnVector extends ColumnVector {
    * nulls, even across resets. This doesn't require any allocation of space.
    */
   protected boolean isMissing;
+
+  /**
+   * isMissing || type instanceof NullType, kept in a field: isAllNull() is on the per-row
+   * isNullAt path, where the type check costs dependent loads.
+   */
+  private boolean allNull;
 
   /**
    * Default size of each array length value. This grows as necessary.
@@ -1044,6 +1051,7 @@ public abstract class WritableColumnVector extends ColumnVector {
    */
   protected WritableColumnVector(int capacity, DataType dataType) {
     super(dataType);
+    this.allNull = type instanceof NullType;
     this.capacity = capacity;
     this.defaultCapacity = capacity;
     this.hugeVectorThreshold = SQLConf.get().vectorizedHugeVectorThreshold();

@@ -252,6 +252,10 @@ public final class Platform {
 
   public static void copyMemory(
     Object src, long srcOffset, Object dst, long dstOffset, long length) {
+    if (length > 0 && length <= SMALL_COPY_THRESHOLD) {
+      copySmall(src, srcOffset, dst, dstOffset, (int) length);
+      return;
+    }
     // Check if dstOffset is before or after srcOffset to determine if we should copy
     // forward or backwards. This is necessary in case src and dst overlap.
     if (dstOffset < srcOffset) {
@@ -282,6 +286,34 @@ public final class Platform {
   public static void throwException(Throwable t) {
     _UNSAFE.throwException(t);
   }
+
+  /**
+   * Copies at most SMALL_COPY_THRESHOLD bytes with 8-byte loads and stores, in the same direction
+   * rule as copyMemory. Unsafe.copyMemory checks its arguments in Java on every call (whether the
+   * base objects are primitive arrays), which costs more than the copy for short rows and keys.
+   */
+  private static void copySmall(
+    Object src, long srcOffset, Object dst, long dstOffset, int length) {
+    int words = length & ~7;
+    if (dstOffset < srcOffset) {
+      for (int i = 0; i < words; i += 8) {
+        _UNSAFE.putLong(dst, dstOffset + i, _UNSAFE.getLong(src, srcOffset + i));
+      }
+      for (int i = words; i < length; i++) {
+        _UNSAFE.putByte(dst, dstOffset + i, _UNSAFE.getByte(src, srcOffset + i));
+      }
+    } else {
+      for (int i = length - 1; i >= words; i--) {
+        _UNSAFE.putByte(dst, dstOffset + i, _UNSAFE.getByte(src, srcOffset + i));
+      }
+      for (int i = words - 8; i >= 0; i -= 8) {
+        _UNSAFE.putLong(dst, dstOffset + i, _UNSAFE.getLong(src, srcOffset + i));
+      }
+    }
+  }
+
+  /** Copies up to this many bytes are done by copySmall. */
+  private static final int SMALL_COPY_THRESHOLD = 64;
 
   /**
    * Limits the number of bytes to copy per {@link Unsafe#copyMemory(long, long, long)} to

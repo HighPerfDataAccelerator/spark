@@ -18,7 +18,7 @@
 package org.apache.spark.sql.execution;
 
 import java.io.IOException;
-import java.util.LinkedList;
+import java.util.ArrayDeque;
 
 import scala.collection.Iterator;
 
@@ -31,7 +31,8 @@ import org.apache.spark.sql.catalyst.expressions.UnsafeRow;
  * (whole stage codegen).
  */
 public abstract class BufferedRowIterator {
-  protected LinkedList<InternalRow> currentRows = new LinkedList<>();
+  // ArrayDeque, not LinkedList: append() runs once per output row and must not allocate a node
+  protected ArrayDeque<InternalRow> currentRows = new ArrayDeque<>();
   // used when there is no column in output
   // Keep it public for codegen to access.
   public UnsafeRow unsafeRow = new UnsafeRow(0);
