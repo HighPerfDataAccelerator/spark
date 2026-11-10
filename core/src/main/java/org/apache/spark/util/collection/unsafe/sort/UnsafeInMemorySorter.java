@@ -364,6 +364,33 @@ public final class UnsafeInMemorySorter {
   }
 
   /**
+   * After a radix sort on a prefix that orders records only partially, sorts each run of equal
+   * prefixes among the numRecords records starting at array index offset with sortComparator
+   * (which compares the records themselves). The other half of the radix sort space is free and
+   * serves as the merge buffer.
+   */
+  private void sortEqualPrefixRuns(int offset, int numRecords) {
+    long bufferStart = offset == nullBoundaryPos ? offset + numRecords * 2L : nullBoundaryPos;
+    LongArray buffer = new LongArray(new MemoryBlock(
+      array.getBaseObject(), array.getBaseOffset() + bufferStart * 8L, numRecords * 16L));
+    Sorter<RecordPointerAndKeyPrefix, LongArray> sorter =
+      new Sorter<>(new UnsafeSortDataFormat(buffer));
+    int end = offset / 2 + numRecords;
+    int runStart = offset / 2;
+    while (runStart < end) {
+      long prefix = array.get(runStart * 2 + 1);
+      int runEnd = runStart + 1;
+      while (runEnd < end && array.get(runEnd * 2 + 1) == prefix) {
+        runEnd++;
+      }
+      if (runEnd - runStart > 1) {
+        sorter.sort(array, runStart, runEnd, sortComparator);
+      }
+      runStart = runEnd;
+    }
+  }
+
+  /**
    * Return an iterator over record pointers in sorted order. For efficiency, all calls to
    * {@code next()} will return the same mutable object.
    */
@@ -380,6 +407,9 @@ public final class UnsafeInMemorySorter {
         offset = RadixSort.sortKeyPrefixArray(
           array, nullBoundaryPos, (pos - nullBoundaryPos) / 2L, 0, 7,
           radixSortSupport.sortDescending(), radixSortSupport.sortSigned());
+        if (radixSortSupport.needsTieBreak()) {
+          sortEqualPrefixRuns(offset, (pos - nullBoundaryPos) / 2);
+        }
       } else {
         MemoryBlock unused = new MemoryBlock(
           array.getBaseObject(),
