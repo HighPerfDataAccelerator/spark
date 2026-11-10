@@ -197,7 +197,28 @@ case class Like(left: Expression, right: Expression, escapeChar: Char)
 
     if (right.foldable) {
       val rVal = right.eval()
-      if (rVal != null) {
+      val segments = if (rVal != null && collationRegexFlags == 0) {
+        LikeSegmentsMatcher.create(rVal.asInstanceOf[UTF8String].toString, escapeChar)
+      } else {
+        null
+      }
+      if (segments != null) {
+        // Only literal text and '%': match the UTF-8 bytes, no String decoding and no regex.
+        val matcherClass = classOf[LikeSegmentsMatcher].getName
+        val patternStr = StringEscapeUtils.escapeJava(rVal.asInstanceOf[UTF8String].toString)
+        val escapedEscapeChar = StringEscapeUtils.escapeJava(escapeChar.toString)
+        val matcher = ctx.addMutableState(matcherClass, "likeSegments",
+          v => s"""$v = $matcherClass.create("$patternStr", '$escapedEscapeChar');""")
+        val eval = left.genCode(ctx)
+        ev.copy(code = code"""
+          ${eval.code}
+          boolean ${ev.isNull} = ${eval.isNull};
+          ${CodeGenerator.javaType(dataType)} ${ev.value} = ${CodeGenerator.defaultValue(dataType)};
+          if (!${ev.isNull}) {
+            ${ev.value} = $matcher.matches(${eval.value});
+          }
+        """)
+      } else if (rVal != null) {
         val regexStr =
           StringEscapeUtils.escapeJava(escape(rVal.asInstanceOf[UTF8String].toString()))
         val pattern = ctx.addMutableState(patternClass, "patternLike",
