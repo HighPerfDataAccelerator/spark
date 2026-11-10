@@ -497,10 +497,23 @@ object ShuffleExchangeExec {
           iter.map { row => (part.getPartition(getPartitionKey(row)), row.copy()) }
         }, isOrderSensitive = isOrderSensitive)
       } else {
+        val partitionIdExpression = newPartitioning match {
+          case h: HashPartitioning => Some(h.partitionIdExpression)
+          case s: ShufflePartitionIdPassThrough => Some(s.partitionIdExpression)
+          case _ => None
+        }
         newRdd.mapPartitionsWithIndexInternal((_, iter) => {
-          val getPartitionKey = getPartitionKeyExtractor()
           val mutablePair = new MutablePair[Int, InternalRow]()
-          iter.map { row => mutablePair.update(part.getPartition(getPartitionKey(row)), row) }
+          partitionIdExpression match {
+            case Some(e) =>
+              // The key is the partition id itself (PartitionIdPassthrough): keep it an Int
+              // rather than passing it through the boxed `InternalRow => Any` extractor per row.
+              val projection = UnsafeProjection.create(e :: Nil, outputAttributes)
+              iter.map { row => mutablePair.update(projection(row).getInt(0), row) }
+            case None =>
+              val getPartitionKey = getPartitionKeyExtractor()
+              iter.map { row => mutablePair.update(part.getPartition(getPartitionKey(row)), row) }
+          }
         }, isOrderSensitive = isOrderSensitive)
       }
     }
