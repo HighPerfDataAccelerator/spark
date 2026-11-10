@@ -204,14 +204,17 @@ public final class UnsafeRowWriter extends UnsafeWriter {
         // keep the offset for future update
         setOffsetAndSize(ordinal, 0);
       } else {
-        final byte[] bytes = input.toJavaBigDecimal().unscaledValue().toByteArray();
-        final int numBytes = bytes.length;
-        assert numBytes <= 16;
+        int numBytes = Decimal.writeUnscaledBytes(input, getBuffer(), cursor());
+        if (numBytes < 0) {
+          final byte[] bytes = input.toJavaBigDecimal().unscaledValue().toByteArray();
+          numBytes = bytes.length;
+          assert numBytes <= 16;
 
-        // Write the bytes to the variable length portion.
-        Platform.copyMemory(
-          bytes, Platform.BYTE_ARRAY_OFFSET, getBuffer(), cursor(), numBytes);
-        setOffsetAndSize(ordinal, bytes.length);
+          // Write the bytes to the variable length portion.
+          Platform.copyMemory(
+            bytes, Platform.BYTE_ARRAY_OFFSET, getBuffer(), cursor(), numBytes);
+        }
+        setOffsetAndSize(ordinal, numBytes);
       }
 
       // move the cursor forward.

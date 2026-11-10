@@ -287,15 +287,18 @@ public final class UnsafeRow extends InternalRow implements Externalizable, Kryo
         // keep the offset for future update
         Platform.putLong(baseObject, getFieldOffset(ordinal), cursor << 32);
       } else {
+        int numBytes = Decimal.writeUnscaledBytes(value, baseObject, baseOffset + cursor);
+        if (numBytes < 0) {
+          final BigInteger integer = value.toJavaBigDecimal().unscaledValue();
+          byte[] bytes = integer.toByteArray();
+          assert(bytes.length <= 16);
 
-        final BigInteger integer = value.toJavaBigDecimal().unscaledValue();
-        byte[] bytes = integer.toByteArray();
-        assert(bytes.length <= 16);
-
-        // Write the bytes to the variable length portion.
-        Platform.copyMemory(
-          bytes, Platform.BYTE_ARRAY_OFFSET, baseObject, baseOffset + cursor, bytes.length);
-        setLong(ordinal, (cursor << 32) | ((long) bytes.length));
+          // Write the bytes to the variable length portion.
+          Platform.copyMemory(
+            bytes, Platform.BYTE_ARRAY_OFFSET, baseObject, baseOffset + cursor, bytes.length);
+          numBytes = bytes.length;
+        }
+        setLong(ordinal, (cursor << 32) | ((long) numBytes));
       }
     }
   }
@@ -382,6 +385,12 @@ public final class UnsafeRow extends InternalRow implements Externalizable, Kryo
     if (precision <= Decimal.MAX_LONG_DIGITS()) {
       return Decimal.createUnsafe(getLong(ordinal), precision, scale);
     } else {
+      final long offsetAndSize = getLong(ordinal);
+      Decimal compact = Decimal.readUnscaledBytes(baseObject,
+        baseOffset + (int) (offsetAndSize >> 32), (int) offsetAndSize, precision, scale);
+      if (compact != null) {
+        return compact;
+      }
       byte[] bytes = getBinary(ordinal);
       BigInteger bigInteger = new BigInteger(bytes);
       BigDecimal javaDecimal = new BigDecimal(bigInteger, scale);

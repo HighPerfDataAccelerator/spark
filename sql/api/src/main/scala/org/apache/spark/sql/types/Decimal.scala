@@ -25,6 +25,7 @@ import org.apache.spark.{QueryContext, SparkArithmeticException}
 import org.apache.spark.annotation.Unstable
 import org.apache.spark.sql.errors.DataTypeErrors
 import org.apache.spark.sql.internal.SqlApiConf
+import org.apache.spark.unsafe.Platform
 import org.apache.spark.unsafe.types.UTF8String
 
 /**
@@ -366,9 +367,21 @@ final class Decimal extends Ordered[Decimal] with Serializable {
       roundMode: BigDecimal.RoundingMode.Value = ROUND_HALF_UP,
       nullOnOverflow: Boolean = true,
       context: QueryContext = null): Decimal = {
-    val copy = clone()
-    if (copy.changePrecision(precision, scale, roundMode)) {
-      copy
+    clone().toPrecisionInPlace(precision, scale, roundMode, nullOnOverflow, context)
+  }
+
+  /**
+   * Like [[toPrecision]], but changes and returns this Decimal instead of a copy (unchanged on
+   * overflow). Only for a value nothing else references, such as the result of `+` or `*`.
+   */
+  private[sql] def toPrecisionInPlace(
+      precision: Int,
+      scale: Int,
+      roundMode: BigDecimal.RoundingMode.Value,
+      nullOnOverflow: Boolean,
+      context: QueryContext): Decimal = {
+    if (changePrecision(precision, scale, roundMode)) {
+      this
     } else {
       if (nullOnOverflow) {
         null
@@ -533,8 +546,20 @@ final class Decimal extends Ordered[Decimal] with Serializable {
   }
 
   // TypeCoercion will take care of the precision, scale of result
-  def *(that: Decimal): Decimal =
+  def *(that: Decimal): Decimal = {
+    if (decimalVal.eq(null) && that.decimalVal.eq(null)) {
+      // Both unscaled values are Longs: multiply them as Longs when the product stays compact.
+      // The result has the precision and scale the BigDecimal product would get.
+      val lv = longVal * that.longVal
+      val s = _scale.toLong + that._scale
+      if (Math.multiplyHigh(longVal, that.longVal) == (lv >> 63) &&
+          lv > -POW_10(MAX_LONG_DIGITS) && lv < POW_10(MAX_LONG_DIGITS) &&
+          s >= 0 && s <= DecimalType.MAX_SCALE) {
+        return Decimal.createUnsafe(lv, math.max(numDigits(lv), s.toInt), s.toInt)
+      }
+    }
     Decimal(toJavaBigDecimal.multiply(that.toJavaBigDecimal, MATH_CONTEXT))
+  }
 
   def /(that: Decimal): Decimal =
     if (that.isZero) {
@@ -592,6 +617,54 @@ object Decimal {
   val MAX_LONG_DIGITS = 18
 
   val POW_10 = Array.tabulate[Long](MAX_LONG_DIGITS + 1)(i => math.pow(10, i).toLong)
+
+  /** Number of decimal digits of `v` (1 for 0), as BigDecimal.precision counts; |v| < 10^18. */
+  private def numDigits(v: Long): Int = {
+    val a = math.abs(v)
+    // floor(log10(2^bits)) is the digit count or one less
+    val n = ((64 - java.lang.Long.numberOfLeadingZeros(a)) * 1233) >>> 12
+    if (a >= POW_10(n)) n + 1 else math.max(n, 1)
+  }
+
+  /**
+   * Writes the unscaled value of `d` at `base` + `offset` as BigInteger.toByteArray would (minimal
+   * big-endian two's complement) when `d` holds it as a Long, and returns the number of bytes, or
+   * -1 when `d` holds a BigDecimal. Lets row writers skip the BigInteger and byte[] allocations.
+   */
+  def writeUnscaledBytes(d: Decimal, base: AnyRef, offset: Long): Int = {
+    if (d.decimalVal.ne(null)) {
+      return -1
+    }
+    val v = d.longVal
+    val numBytes = (64 - java.lang.Long.numberOfLeadingZeros(v ^ (v >> 63))) / 8 + 1
+    var i = 0
+    while (i < numBytes) {
+      Platform.putByte(base, offset + i, (v >> (8 * (numBytes - 1 - i))).toByte)
+      i += 1
+    }
+    numBytes
+  }
+
+  /**
+   * Reads an unscaled value written as BigInteger.toByteArray, when it has at most 8 bytes and fits
+   * a compact Decimal; returns null otherwise (the caller then goes through BigInteger).
+   */
+  def readUnscaledBytes(
+      base: AnyRef, offset: Long, numBytes: Int, precision: Int, scale: Int): Decimal = {
+    if (numBytes < 1 || numBytes > 8) {
+      return null
+    }
+    var v = Platform.getByte(base, offset).toLong // sign-extended
+    var i = 1
+    while (i < numBytes) {
+      v = (v << 8) | (Platform.getByte(base, offset + i) & 0xff)
+      i += 1
+    }
+    if (v <= -POW_10(MAX_LONG_DIGITS) || v >= POW_10(MAX_LONG_DIGITS)) {
+      return null
+    }
+    createUnsafe(v, precision, scale)
+  }
 
   // SPARK-45786 Using RoundingMode.HALF_UP with MathContext may cause inaccurate SQL results
   // because TypeCoercion later rounds again. Instead, always round down and use 1 digit longer

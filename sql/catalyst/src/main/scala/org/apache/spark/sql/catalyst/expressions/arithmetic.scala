@@ -284,9 +284,10 @@ abstract class BinaryArithmetic extends BinaryOperator with SupportQueryContext 
       } else {
         s"${ev.isNull} = ${ev.value} == null;"
       }
+      // $decimalMethod returns a new Decimal, so its precision is changed in place, not on a copy
       nullSafeCodeGen(ctx, ev, (eval1, eval2) => {
         s"""
-           |${ev.value} = $eval1.$decimalMethod($eval2).toPrecision(
+           |${ev.value} = $eval1.$decimalMethod($eval2).toPrecisionInPlace(
            |  $precision, $scale, Decimal.ROUND_HALF_UP(), ${!failOnError}, $errorContextCode);
            |$updateIsNull
        """.stripMargin
@@ -718,8 +719,10 @@ trait DivModLike extends BinaryArithmetic {
     val operation = super.dataType match {
       case DecimalType.Fixed(precision, scale) =>
         val decimalValue = ctx.freshName("decimalValue")
+        // $decimalMethod returns a new Decimal, so its precision is changed in place, not on a copy
         s"""
-           |Decimal $decimalValue = ${eval1.value}.$decimalMethod(${eval2.value}).toPrecision(
+           |Decimal $decimalValue =
+           |  ${eval1.value}.$decimalMethod(${eval2.value}).toPrecisionInPlace(
            |  $precision, $scale, Decimal.ROUND_HALF_UP(), ${!failOnError}, $errorContextCode);
            |if ($decimalValue != null) {
            |  ${ev.value} = ${decimalToDataTypeCodeGen(s"$decimalValue")};
