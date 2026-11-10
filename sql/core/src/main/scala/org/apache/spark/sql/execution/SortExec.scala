@@ -28,6 +28,8 @@ import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGe
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.NANOS_PER_MILLIS
 import org.apache.spark.sql.execution.metric.SQLMetrics
+import org.apache.spark.sql.types.{DateType, IntegerType, StructType}
+import org.apache.spark.util.collection.unsafe.sort.PrefixComparators
 
 /**
  * Performs (external) sorting.
@@ -75,31 +77,35 @@ case class SortExec(
    */
   def createSorter(): UnsafeExternalRowSorter = {
     val ordering = RowOrdering.create(sortOrder, output)
-
-    // The comparator for comparing prefix
-    val boundSortExpression = BindReferences.bindReference(sortOrder.head, output)
-    val prefixComparator = SortPrefixUtils.getPrefixComparator(boundSortExpression)
-
-    val canUseRadixSort = enableRadixSort && sortOrder.length == 1 &&
-      SortPrefixUtils.canSortFullyWithPrefix(boundSortExpression)
-
-    // The generator for prefix
-    val prefixExpr = SortPrefix(boundSortExpression)
-    val prefixProjection = UnsafeProjection.create(Seq(prefixExpr))
-    val prefixComputer = new UnsafeExternalRowSorter.PrefixComputer {
-      private val result = new UnsafeExternalRowSorter.PrefixComputer.Prefix
-      override def computePrefix(row: InternalRow):
-          UnsafeExternalRowSorter.PrefixComputer.Prefix = {
-        val prefix = prefixProjection.apply(row)
-        result.isNull = prefix.isNullAt(0)
-        result.value = if (result.isNull) prefixExpr.nullValue else prefix.getLong(0)
-        result
-      }
-    }
-
     val pageSize = SparkEnv.get.memoryManager.pageSizeBytes
-    rowSorter = UnsafeExternalRowSorter.create(
-      schema, ordering, prefixComparator, prefixComputer, pageSize, canUseRadixSort)
+    val boundSortOrder = sortOrder.map(BindReferences.bindReference(_, output))
+    rowSorter = if (enableRadixSort && SortExec.isTwoIntKeys(boundSortOrder)) {
+      SortExec.createTwoIntKeySorter(boundSortOrder, schema, ordering, pageSize)
+    } else {
+      // The comparator for comparing prefix
+      val boundSortExpression = boundSortOrder.head
+      val prefixComparator = SortPrefixUtils.getPrefixComparator(boundSortExpression)
+
+      val canUseRadixSort = enableRadixSort && sortOrder.length == 1 &&
+        SortPrefixUtils.canSortFullyWithPrefix(boundSortExpression)
+
+      // The generator for prefix
+      val prefixExpr = SortPrefix(boundSortExpression)
+      val prefixProjection = UnsafeProjection.create(Seq(prefixExpr))
+      val prefixComputer = new UnsafeExternalRowSorter.PrefixComputer {
+        private val result = new UnsafeExternalRowSorter.PrefixComputer.Prefix
+        override def computePrefix(row: InternalRow):
+            UnsafeExternalRowSorter.PrefixComputer.Prefix = {
+          val prefix = prefixProjection.apply(row)
+          result.isNull = prefix.isNullAt(0)
+          result.value = if (result.isNull) prefixExpr.nullValue else prefix.getLong(0)
+          result
+        }
+      }
+
+      UnsafeExternalRowSorter.create(
+        schema, ordering, prefixComparator, prefixComputer, pageSize, canUseRadixSort)
+    }
 
     if (testSpillFrequency > 0) {
       rowSorter.setTestSpillFrequency(testSpillFrequency)
@@ -211,4 +217,45 @@ case class SortExec(
 
   override protected def withNewChildInternal(newChild: SparkPlan): SortExec =
     copy(child = newChild)
+}
+
+object SortExec {
+  /**
+   * Whether the sort is on exactly two non-null 32-bit integer keys. Their values then fit
+   * together in the 64-bit sort prefix, so the prefix orders the rows fully and radix sort
+   * replaces the comparison sort, which follows a record pointer whenever the first key ties
+   * (e.g. sort-merge joins on (ticket_number, item_sk)).
+   */
+  def isTwoIntKeys(boundSortOrder: Seq[SortOrder]): Boolean =
+    boundSortOrder.length == 2 && boundSortOrder.forall { o =>
+      !o.child.nullable && (o.dataType == IntegerType || o.dataType == DateType)
+    }
+
+  def createTwoIntKeySorter(
+      boundSortOrder: Seq[SortOrder],
+      schema: StructType,
+      ordering: Ordering[InternalRow],
+      pageSize: Long): UnsafeExternalRowSorter = {
+    val keyProjection = UnsafeProjection.create(boundSortOrder.map(_.child))
+    val ascending0 = boundSortOrder(0).isAscending
+    val ascending1 = boundSortOrder(1).isAscending
+    val prefixComputer = new UnsafeExternalRowSorter.PrefixComputer {
+      private val result = new UnsafeExternalRowSorter.PrefixComputer.Prefix
+      // Maps an int to 32 unsigned bits in the requested order.
+      private def encode(v: Int, ascending: Boolean): Long = {
+        val u = (v ^ Int.MinValue).toLong & 0xffffffffL
+        if (ascending) u else u ^ 0xffffffffL
+      }
+      override def computePrefix(row: InternalRow):
+          UnsafeExternalRowSorter.PrefixComputer.Prefix = {
+        val keys = keyProjection.apply(row)
+        result.isNull = false
+        result.value =
+          (encode(keys.getInt(0), ascending0) << 32) | encode(keys.getInt(1), ascending1)
+        result
+      }
+    }
+    UnsafeExternalRowSorter.create(
+      schema, ordering, PrefixComparators.BINARY, prefixComputer, pageSize, true)
+  }
 }
