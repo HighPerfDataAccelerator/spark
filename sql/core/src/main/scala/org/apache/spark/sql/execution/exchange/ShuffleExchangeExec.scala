@@ -503,17 +503,24 @@ object ShuffleExchangeExec {
           case _ => None
         }
         newRdd.mapPartitionsWithIndexInternal((_, iter) => {
-          val mutablePair = new MutablePair[Int, InternalRow]()
-          partitionIdExpression match {
+          // MutablePair is not specialized for (Int, AnyRef), and the shuffle writers read the
+          // partition id as an object: hand them cached boxes instead of boxing it per row (the
+          // Integer cache stops at 127).
+          val partitionIds = Array.tabulate[AnyRef](part.numPartitions)(Integer.valueOf)
+          val mutablePair = new MutablePair[AnyRef, InternalRow]()
+          val pairs = partitionIdExpression match {
             case Some(e) =>
               // The key is the partition id itself (PartitionIdPassthrough): keep it an Int
               // rather than passing it through the boxed `InternalRow => Any` extractor per row.
               val projection = UnsafeProjection.create(e :: Nil, outputAttributes)
-              iter.map { row => mutablePair.update(projection(row).getInt(0), row) }
+              iter.map { row => mutablePair.update(partitionIds(projection(row).getInt(0)), row) }
             case None =>
               val getPartitionKey = getPartitionKeyExtractor()
-              iter.map { row => mutablePair.update(part.getPartition(getPartitionKey(row)), row) }
+              iter.map { row =>
+                mutablePair.update(partitionIds(part.getPartition(getPartitionKey(row))), row)
+              }
           }
+          pairs.asInstanceOf[Iterator[Product2[Int, InternalRow]]]
         }, isOrderSensitive = isOrderSensitive)
       }
     }
