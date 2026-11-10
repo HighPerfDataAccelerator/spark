@@ -79,7 +79,7 @@ case class SortExec(
     val ordering = RowOrdering.create(sortOrder, output)
     val pageSize = SparkEnv.get.memoryManager.pageSizeBytes
     val boundSortOrder = sortOrder.map(BindReferences.bindReference(_, output))
-    rowSorter = if (enableRadixSort && SortExec.isTwoIntKeys(boundSortOrder)) {
+    rowSorter = if (enableRadixSort && SortExec.startsWithTwoIntKeys(boundSortOrder)) {
       SortExec.createTwoIntKeySorter(boundSortOrder, schema, ordering, pageSize)
     } else {
       // The comparator for comparing prefix
@@ -221,26 +221,35 @@ case class SortExec(
 
 object SortExec {
   /**
-   * Whether the sort is on exactly two non-null 32-bit integer keys. Their values then fit
-   * together in the 64-bit sort prefix, so the prefix orders the rows fully and radix sort
-   * replaces the comparison sort, which follows a record pointer whenever the first key ties
-   * (e.g. sort-merge joins on (ticket_number, item_sk)).
+   * Whether the sort starts with two 32-bit integer keys. Their values then fit together in the
+   * 64-bit sort prefix, so radix sort on the prefix replaces the comparison sort, which follows a
+   * record pointer whenever the first key ties (e.g. sort-merge joins on (ticket_number, item_sk)).
    */
-  def isTwoIntKeys(boundSortOrder: Seq[SortOrder]): Boolean =
-    boundSortOrder.length == 2 && boundSortOrder.forall { o =>
-      !o.child.nullable && (o.dataType == IntegerType || o.dataType == DateType)
+  def startsWithTwoIntKeys(boundSortOrder: Seq[SortOrder]): Boolean =
+    boundSortOrder.length >= 2 && boundSortOrder.take(2).forall { o =>
+      o.dataType == IntegerType || o.dataType == DateType
     }
 
+  /**
+   * The prefix orders the rows fully when there are exactly two non-null keys. Otherwise a null
+   * key is encoded as the lowest (nulls first) or highest (nulls last) value, which a real value
+   * may share, and further keys are not in the prefix: rows with equal prefixes are then ordered
+   * with the full ordering after the radix sort (PrefixComparators.BINARY_TIE_BREAK).
+   */
   def createTwoIntKeySorter(
       boundSortOrder: Seq[SortOrder],
       schema: StructType,
       ordering: Ordering[InternalRow],
       pageSize: Long): UnsafeExternalRowSorter = {
-    val keyProjection = UnsafeProjection.create(boundSortOrder.map(_.child))
-    val ascending0 = boundSortOrder(0).isAscending
-    val ascending1 = boundSortOrder(1).isAscending
+    val keyProjection = UnsafeProjection.create(boundSortOrder.take(2).map(_.child))
+    val Seq(o0, o1) = boundSortOrder.take(2)
+    val exact = boundSortOrder.length == 2 && !o0.child.nullable && !o1.child.nullable
     val prefixComputer = new UnsafeExternalRowSorter.PrefixComputer {
       private val result = new UnsafeExternalRowSorter.PrefixComputer.Prefix
+      private val ascending0 = o0.isAscending
+      private val ascending1 = o1.isAscending
+      private val nullsFirst0 = o0.nullOrdering == NullsFirst
+      private val nullsFirst1 = o1.nullOrdering == NullsFirst
       // Maps an int to 32 unsigned bits in the requested order.
       private def encode(v: Int, ascending: Boolean): Long = {
         val u = (v ^ Int.MinValue).toLong & 0xffffffffL
@@ -250,12 +259,22 @@ object SortExec {
           UnsafeExternalRowSorter.PrefixComputer.Prefix = {
         val keys = keyProjection.apply(row)
         result.isNull = false
-        result.value =
-          (encode(keys.getInt(0), ascending0) << 32) | encode(keys.getInt(1), ascending1)
+        result.value = if (keys.isNullAt(0)) {
+          // before (after) every row whose first key is the lowest (highest) value
+          if (nullsFirst0) 0L else -1L
+        } else {
+          val low = if (keys.isNullAt(1)) {
+            if (nullsFirst1) 0L else 0xffffffffL
+          } else {
+            encode(keys.getInt(1), ascending1)
+          }
+          (encode(keys.getInt(0), ascending0) << 32) | low
+        }
         result
       }
     }
-    UnsafeExternalRowSorter.create(
-      schema, ordering, PrefixComparators.BINARY, prefixComputer, pageSize, true)
+    UnsafeExternalRowSorter.create(schema, ordering,
+      if (exact) PrefixComparators.BINARY else PrefixComparators.BINARY_TIE_BREAK,
+      prefixComputer, pageSize, true)
   }
 }

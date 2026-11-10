@@ -38,6 +38,12 @@ public class PrefixComparators {
   public static final PrefixComparator BINARY_NULLS_LAST = new UnsignedPrefixComparatorNullsLast();
   public static final PrefixComparator BINARY_DESC_NULLS_FIRST =
     new UnsignedPrefixComparatorDescNullsFirst();
+  /**
+   * Ascending unsigned order of a prefix that orders records only partially: records whose
+   * prefixes are equal may still differ, so after a radix sort they are ordered with the record
+   * comparator.
+   */
+  public static final PrefixComparator BINARY_TIE_BREAK = new UnsignedPrefixComparatorTieBreak();
 
   public static final PrefixComparator LONG = new SignedPrefixComparator();
   public static final PrefixComparator LONG_DESC = new SignedPrefixComparatorDesc();
@@ -94,6 +100,12 @@ public class PrefixComparators {
 
     /** @return Whether the sort should put nulls first or last. */
     public abstract boolean nullsFirst();
+
+    /**
+     * @return Whether records with equal prefixes may still have to be ordered by the record
+     * comparator after the radix sort, i.e. the prefix does not fully determine the order.
+     */
+    public boolean needsTieBreak() { return false; }
   }
 
   //
@@ -104,6 +116,17 @@ public class PrefixComparators {
     @Override public boolean sortDescending() { return false; }
     @Override public boolean sortSigned() { return false; }
     @Override public boolean nullsFirst() { return true; }
+    @Override
+    public int compare(long aPrefix, long bPrefix) {
+      return UnsignedLongs.compare(aPrefix, bPrefix);
+    }
+  }
+
+  public static final class UnsignedPrefixComparatorTieBreak extends RadixSortSupport {
+    @Override public boolean sortDescending() { return false; }
+    @Override public boolean sortSigned() { return false; }
+    @Override public boolean nullsFirst() { return true; }
+    @Override public boolean needsTieBreak() { return true; }
     @Override
     public int compare(long aPrefix, long bPrefix) {
       return UnsignedLongs.compare(aPrefix, bPrefix);
