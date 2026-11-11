@@ -28,7 +28,7 @@ import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGe
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.NANOS_PER_MILLIS
 import org.apache.spark.sql.execution.metric.SQLMetrics
-import org.apache.spark.sql.types.{DateType, IntegerType, StructType}
+import org.apache.spark.sql.types.{DataType, DateType, IntegerType, LongType, StructType}
 import org.apache.spark.util.collection.unsafe.sort.PrefixComparators
 
 /**
@@ -221,18 +221,21 @@ case class SortExec(
 
 object SortExec {
   /**
-   * Whether the sort starts with two 32-bit integer keys. Their values then fit together in the
-   * 64-bit sort prefix, so radix sort on the prefix replaces the comparison sort, which follows a
-   * record pointer whenever the first key ties (e.g. sort-merge joins on (ticket_number, item_sk)).
+   * Whether the sort starts with a 32-bit integer key followed by a 32- or 64-bit integer key.
+   * Both then fit in the 64-bit sort prefix (a 64-bit second key saturated to 32 bits), so radix
+   * sort on the prefix replaces the comparison sort, which follows a record pointer whenever the
+   * first key ties (e.g. sort-merge joins on (item_sk, ticket_number)).
    */
   def startsWithTwoIntKeys(boundSortOrder: Seq[SortOrder]): Boolean =
-    boundSortOrder.length >= 2 && boundSortOrder.take(2).forall { o =>
-      o.dataType == IntegerType || o.dataType == DateType
-    }
+    boundSortOrder.length >= 2 && isInt32(boundSortOrder.head.dataType) &&
+      (isInt32(boundSortOrder(1).dataType) || boundSortOrder(1).dataType == LongType)
+
+  private def isInt32(t: DataType): Boolean = t == IntegerType || t == DateType
 
   /**
-   * The prefix orders the rows fully when there are exactly two non-null keys. Otherwise a null
-   * key is encoded as the lowest (nulls first) or highest (nulls last) value, which a real value
+   * The prefix orders the rows fully when there are exactly two non-null 32-bit keys. Otherwise
+   * a null key is encoded as the lowest (nulls first) or highest (nulls last) value, a 64-bit
+   * second key outside the Int range as Int.MinValue or Int.MaxValue, both of which a real value
    * may share, and further keys are not in the prefix: rows with equal prefixes are then ordered
    * with the full ordering after the radix sort (PrefixComparators.BINARY_TIE_BREAK).
    */
@@ -243,7 +246,8 @@ object SortExec {
       pageSize: Long): UnsafeExternalRowSorter = {
     val keyProjection = UnsafeProjection.create(boundSortOrder.take(2).map(_.child))
     val Seq(o0, o1) = boundSortOrder.take(2)
-    val exact = boundSortOrder.length == 2 && !o0.child.nullable && !o1.child.nullable
+    val long1 = o1.dataType == LongType
+    val exact = boundSortOrder.length == 2 && !o0.child.nullable && !o1.child.nullable && !long1
     val prefixComputer = new UnsafeExternalRowSorter.PrefixComputer {
       private val result = new UnsafeExternalRowSorter.PrefixComputer.Prefix
       private val ascending0 = o0.isAscending
@@ -265,6 +269,10 @@ object SortExec {
         } else {
           val low = if (keys.isNullAt(1)) {
             if (nullsFirst1) 0L else 0xffffffffL
+          } else if (long1) {
+            val v = keys.getLong(1)
+            encode(if (v < Int.MinValue) Int.MinValue else if (v > Int.MaxValue) Int.MaxValue
+              else v.toInt, ascending1)
           } else {
             encode(keys.getInt(1), ascending1)
           }
