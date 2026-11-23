@@ -47,6 +47,7 @@ import org.apache.spark.security.CryptoStreamUtils
 import org.apache.spark.serializer.{JavaSerializer, Serializer, SerializerManager}
 import org.apache.spark.shuffle.ShuffleManager
 import org.apache.spark.storage._
+import org.apache.spark.unsafe.Platform
 import org.apache.spark.util.{RpcUtils, Utils}
 import org.apache.spark.util.ArrayImplicits._
 
@@ -357,6 +358,8 @@ object SparkEnv extends Logging {
       mockOutputCommitCoordinator: Option[OutputCommitCoordinator] = None): SparkEnv = {
 
     val isDriver = SparkContext.isDriver(executorId)
+    logInfo(log"JDK prefetch instructions (Platform.PREFETCH_SUPPORTED): " +
+      log"${MDC(LogKeys.STATUS, Platform.PREFETCH_SUPPORTED)}")
 
     // Listener bus is only used on the driver
     if (isDriver) {

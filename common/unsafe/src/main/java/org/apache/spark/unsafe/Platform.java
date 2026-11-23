@@ -128,7 +128,8 @@ public final class Platform {
    * (prefetchReadStatic / prefetchWriteStatic, available only in patched JDKs). When false,
    * {@link #prefetchRead} and {@link #prefetchWrite} do nothing and the callers turn their
    * prefetching off. Set the JVM system property {@code unsafe.prefetch.jdk} to false to ignore
-   * the JDK methods even when they exist.
+   * the JDK methods even when they exist, or to true to fail class initialization when they are
+   * missing.
    */
   public static final boolean PREFETCH_SUPPORTED;
 
@@ -430,18 +431,27 @@ public final class Platform {
 
   static {
     final MethodType type = MethodType.methodType(void.class, Object.class, long.class);
+    final String mode = System.getProperty("unsafe.prefetch.jdk");
     MethodHandle read = null;
     MethodHandle write = null;
-    if (_UNSAFE != null && !"false".equals(System.getProperty("unsafe.prefetch.jdk"))) {
+    if (_UNSAFE != null && !"false".equals(mode)) {
       try {
         MethodHandles.Lookup lookup = MethodHandles.publicLookup();
         read = lookup.findStatic(Unsafe.class, "prefetchReadStatic", type);
         write = lookup.findStatic(Unsafe.class, "prefetchWriteStatic", type);
       } catch (Throwable t) {
         // Stock JDK: no prefetch methods.
+        if ("true".equals(mode)) {
+          throw new IllegalStateException("unsafe.prefetch.jdk=true, but sun.misc.Unsafe has no " +
+            "prefetchReadStatic / prefetchWriteStatic (JDK " +
+            System.getProperty("java.runtime.version") + ")", t);
+        }
         read = null;
         write = null;
       }
+    } else if ("true".equals(mode)) {
+      throw new IllegalStateException(
+        "unsafe.prefetch.jdk=true, but sun.misc.Unsafe is unavailable");
     }
     PREFETCH_SUPPORTED = read != null && write != null;
     PREFETCH_READ = PREFETCH_SUPPORTED ? read : MethodHandles.empty(type);
