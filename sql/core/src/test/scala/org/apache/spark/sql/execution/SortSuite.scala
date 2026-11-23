@@ -134,6 +134,35 @@ class SortSuite extends SharedSparkSession {
     }
   }
 
+  test("leading BIGINT radix prefix preserves full row ordering on prefix ties") {
+    val limit = 1L << 30
+    val keys = Seq[java.lang.Long](null, Long.MinValue, Long.MinValue + 1, -limit - 1,
+      -limit, -limit + 1, -1L, 0L, limit - 1, limit, limit + 1, Long.MaxValue - 1, Long.MaxValue)
+    val rows = for (a <- keys; b <- keys; c <- Seq(0, 1)) yield Row(a, b, c)
+    val schema = new StructType().add("a", LongType).add("b", LongType).add("c", IntegerType)
+    val df = spark.createDataFrame(sparkContext.parallelize(new Random(42).shuffle(rows), 1),
+      schema)
+
+    withSQLConf("spark.sql.sort.longKeyPrefix.enabled" -> "true",
+        SQLConf.RADIX_SORT_ENABLED.key -> "true") {
+      for (first <- Seq($"a".asc, $"a".asc_nullsLast, $"a".desc, $"a".desc_nullsFirst)) {
+        val order = Seq(first, $"b".desc, $"c".asc)
+        checkThatPlansAgree(df,
+          p => SortExec(order, global = true, p, testSpillFrequency = 23),
+          ReferenceSort(order, global = true, _: SparkPlan),
+          sortAnswers = false)
+      }
+
+      // Two non-null keys still require a tie break when the first key is wide.
+      val nonNull = df.selectExpr("coalesce(a, 0L) AS a", "cast(coalesce(c, 0) as int) AS b")
+      val order = Seq($"a".asc, $"b".desc)
+      checkThatPlansAgree(nonNull,
+        SortExec(order, global = true, _: SparkPlan),
+        ReferenceSort(order, global = true, _: SparkPlan),
+        sortAnswers = false)
+    }
+  }
+
   // Test sorting on different data types
   for (
     dataType <- DataTypeTestUtils.atomicTypes ++ Set(NullType);
