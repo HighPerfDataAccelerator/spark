@@ -549,6 +549,35 @@ public final class BytesToBytesMap extends MemoryConsumer {
   }
 
   /**
+   * Build a read-only filter over the stored key hashes. One word holds two bits per hash.
+   * The caller must keep the map immutable for the lifetime of the filter.
+   */
+  public long[] buildReadOnlyProbeFilter() {
+    if (numKeys < 512 || numKeys > 262144) {
+      return null;
+    }
+    // Round up to a power of two so each probe reads one word using a mask.
+    int words = Integer.highestOneBit((numKeys - 1) / 4) << 1;
+    long[] bits = new long[words];
+    for (int pos = 0; pos <= mask; pos++) {
+      if (longArray.get(2 * pos) != 0) {
+        int hash = (int) longArray.get(2 * pos + 1);
+        bits[hash & (words - 1)] |= probeBits(hash);
+      }
+    }
+    return bits;
+  }
+
+  private static long probeBits(int hash) {
+    return (1L << (hash >>> 26)) | (1L << ((hash >>> 20) & 63));
+  }
+
+  public static boolean mightContainHash(long[] bits, int hash) {
+    long mask = probeBits(hash);
+    return (bits[hash & (bits.length - 1)] & mask) == mask;
+  }
+
+  /**
    * Looks up a key, and saves the result in provided `loc`.
    *
    * This is a thread-safe version of `lookup`, could be used by multiple threads.

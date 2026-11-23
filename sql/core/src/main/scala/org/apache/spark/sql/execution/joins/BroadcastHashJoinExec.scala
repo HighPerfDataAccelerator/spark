@@ -200,10 +200,18 @@ case class BroadcastHashJoinExec private(
     val broadcast = ctx.addReferenceObj("broadcast", broadcastRelation)
     val clsName = broadcastRelation.value.getClass.getName
 
+    val filter = conf.getConfString("spark.sql.broadcastJoin.filterProbeHashes", "false")
+      .toBoolean &&
+      joinType == Inner && condition.isEmpty && streamedBoundKeys.size > 1 &&
+      streamedKeys.forall(_.isInstanceOf[AttributeReference]) &&
+      broadcastRelation.value.isInstanceOf[UnsafeHashedRelation] &&
+      broadcastRelation.value.keyIsUnique
+    val copyMethod = if (filter) "asFilteredReadOnlyCopy" else "asReadOnlyCopy"
+
     // Inline mutable state since not many join operations in a task
     val relationTerm = ctx.addMutableState(clsName, "relation",
       v => s"""
-         | $v = (($clsName) $broadcast.value()).asReadOnlyCopy();
+         | $v = (($clsName) $broadcast.value()).$copyMethod();
          | incPeakExecutionMemory($v.estimatedSize());
        """.stripMargin, forceInline = true)
     (broadcastRelation, relationTerm)

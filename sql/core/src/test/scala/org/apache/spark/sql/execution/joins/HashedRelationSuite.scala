@@ -117,6 +117,35 @@ abstract class HashedRelationSuite extends SharedSparkSession {
     assert(java.util.Arrays.equals(os2.toByteArray, os.toByteArray))
   }
 
+  test("broadcast probe filter preserves exact composite lookups") {
+    val keys = Seq(BoundReference(0, LongType, true), BoundReference(1, IntegerType, true))
+    val project = UnsafeProjection.create(keys)
+    def row(first: Long, second: Int): UnsafeRow = project(InternalRow(first, second)).copy()
+
+    for ((offset, step, count) <- Seq(
+        (Int.MinValue, 1, 1024), (Int.MaxValue - 2048, 1, 1024),
+        (0, 1000, 1024), (0, 1, 16))) {
+      val rows = (0 until count).map { i =>
+        val first = if (i % 2 == 0) Long.MinValue + i else Long.MaxValue - i
+        row(first, offset + (i / 2) * step)
+      }
+      val map = UnsafeHashedRelation(rows.iterator, keys, rows.size, mm)
+        .asInstanceOf[UnsafeHashedRelation]
+      try {
+        val plain = map.asReadOnlyCopy()
+        val copies = Seq(map.asFilteredReadOnlyCopy(), map.asFilteredReadOnlyCopy())
+        val probes = rows ++ rows.map(r => row(r.getLong(0) ^ 64L, r.getInt(1))) ++
+          Seq(row(0L, Int.MinValue), row(-1L, Int.MaxValue), project(InternalRow(null, 1)).copy())
+        for (key <- probes; copy <- copies) {
+          assert(Option(copy.getValue(key)).map(_.copy()) ==
+            Option(plain.getValue(key)).map(_.copy()))
+        }
+      } finally {
+        map.close()
+      }
+    }
+  }
+
   test("test serialization empty hash map") {
     val binaryMap = new BytesToBytesMap(mm, 1, 1)
     val os = new ByteArrayOutputStream()
