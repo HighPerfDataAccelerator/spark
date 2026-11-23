@@ -79,7 +79,12 @@ case class SortExec(
     val ordering = RowOrdering.create(sortOrder, output)
     val pageSize = SparkEnv.get.memoryManager.pageSizeBytes
     val boundSortOrder = sortOrder.map(BindReferences.bindReference(_, output))
-    rowSorter = if (enableRadixSort && SortExec.startsWithTwoIntKeys(boundSortOrder)) {
+    val longFirst = boundSortOrder.length >= 2 && boundSortOrder.head.dataType == LongType &&
+      SortExec.isIntegralSortKey(boundSortOrder(1).dataType) &&
+      conf.getConfString("spark.sql.sort.longKeyPrefix.enabled", "false").toBoolean
+    val useCompositePrefix = enableRadixSort &&
+      (longFirst || SortExec.startsWithTwoIntKeys(boundSortOrder))
+    rowSorter = if (useCompositePrefix) {
       SortExec.createTwoIntKeySorter(boundSortOrder, schema, ordering, pageSize)
     } else {
       // The comparator for comparing prefix
@@ -228,7 +233,9 @@ object SortExec {
    */
   def startsWithTwoIntKeys(boundSortOrder: Seq[SortOrder]): Boolean =
     boundSortOrder.length >= 2 && isInt32(boundSortOrder.head.dataType) &&
-      (isInt32(boundSortOrder(1).dataType) || boundSortOrder(1).dataType == LongType)
+      isIntegralSortKey(boundSortOrder(1).dataType)
+
+  private def isIntegralSortKey(t: DataType): Boolean = isInt32(t) || t == LongType
 
   private def isInt32(t: DataType): Boolean = t == IntegerType || t == DateType
 
@@ -246,8 +253,10 @@ object SortExec {
       pageSize: Long): UnsafeExternalRowSorter = {
     val keyProjection = UnsafeProjection.create(boundSortOrder.take(2).map(_.child))
     val Seq(o0, o1) = boundSortOrder.take(2)
+    val long0 = o0.dataType == LongType
     val long1 = o1.dataType == LongType
-    val exact = boundSortOrder.length == 2 && !o0.child.nullable && !o1.child.nullable && !long1
+    val exact = boundSortOrder.length == 2 && !o0.child.nullable && !o1.child.nullable &&
+      !long0 && !long1
     val prefixComputer = new UnsafeExternalRowSorter.PrefixComputer {
       private val result = new UnsafeExternalRowSorter.PrefixComputer.Prefix
       private val ascending0 = o0.isAscending
@@ -276,7 +285,22 @@ object SortExec {
           } else {
             encode(keys.getInt(1), ascending1)
           }
-          (encode(keys.getInt(0), ascending0) << 32) | low
+          if (!long0) {
+            (encode(keys.getInt(0), ascending0) << 32) | low
+          } else {
+            val first = keys.getLong(0)
+            // The middle half of the unsigned prefix space holds signed 31-bit first keys
+            // paired with their second key. The outer quarters retain 62 bits of a wide key.
+            // Any collision is resolved by the existing full-row tie-break comparator.
+            val compactLimit = 1L << 30
+            if (first >= -compactLimit && first < compactLimit) {
+              (encode(first.toInt, ascending0) << 32) | low
+            } else {
+              val prefix = if (first < 0) (first ^ Long.MinValue) >>> 1
+                else (3L << 62) | (first >>> 1)
+              if (ascending0) prefix else ~prefix
+            }
+          }
         }
         result
       }
