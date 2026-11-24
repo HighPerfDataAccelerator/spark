@@ -23,7 +23,7 @@ import java.nio.ByteBuffer
 import scala.reflect.ClassTag
 
 import org.apache.spark.SparkUnsupportedOperationException
-import org.apache.spark.serializer.{DeserializationStream, SerializationStream, Serializer, SerializerInstance}
+import org.apache.spark.serializer.{DeserializationStream, DirectRecordSerialization, SerializationStream, Serializer, SerializerInstance}
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.unsafe.Platform
@@ -50,7 +50,32 @@ class UnsafeRowSerializer(
 
 private class UnsafeRowSerializerInstance(
     numFields: Int,
-    dataSize: SQLMetric) extends SerializerInstance {
+    dataSize: SQLMetric) extends SerializerInstance with DirectRecordSerialization {
+
+  override def serializeRecord(
+      key: Any, value: Any, buf: Array[Byte], offset: Int, limit: Int): Int = {
+    val row = value.asInstanceOf[UnsafeRow]
+    val size = row.getSizeInBytes
+    if (size + 4 > limit - offset) {
+      -1
+    } else {
+      if (dataSize != null) {
+        dataSize.add(size)
+      }
+      // The record length, high byte first (as UnsafeRowDataOutputStream.writeInt), then the row.
+      buf(offset) = (size >>> 24).toByte
+      buf(offset + 1) = (size >>> 16).toByte
+      buf(offset + 2) = (size >>> 8).toByte
+      buf(offset + 3) = size.toByte
+      Platform.copyMemory(row.getBaseObject, row.getBaseOffset,
+        buf, Platform.BYTE_ARRAY_OFFSET + offset + 4, size)
+      size + 4
+    }
+  }
+
+  override def serializedRecordSize(key: Any, value: Any): Int =
+    value.asInstanceOf[UnsafeRow].getSizeInBytes + 4
+
   /**
    * Serializes a stream of UnsafeRows. Within the stream, each record consists of a record
    * length (stored as a 4-byte integer, written high byte first), followed by the record's bytes.

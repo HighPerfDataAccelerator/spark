@@ -361,6 +361,20 @@ private[spark] class DiskBlockObjectWriter(
   }
 
   /**
+   * Notes that `n` records were written as serialized bytes with `write(bytes, offs, len)`, as
+   * `recordWritten()` does for one record.
+   */
+  def recordsWritten(n: Int): Unit = {
+    val before = numRecordsWritten
+    numRecordsWritten += n
+    writeMetrics.incRecordsWritten(n)
+
+    if (before / 16384 != numRecordsWritten / 16384) {
+      updateBytesWritten()
+    }
+  }
+
+  /**
    * Report the number of bytes written in this writer's shuffle write metrics.
    * Note that this is only valid before the underlying streams are closed.
    */
