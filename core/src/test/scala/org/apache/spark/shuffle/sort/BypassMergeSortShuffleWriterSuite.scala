@@ -17,11 +17,13 @@
 
 package org.apache.spark.shuffle.sort
 
-import java.io.File
+import java.io.{DataInputStream, DataOutputStream, EOFException, File, FileInputStream, InputStream, OutputStream}
+import java.nio.ByteBuffer
 import java.util.UUID
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
+import scala.reflect.ClassTag
 import scala.util.Random
 
 import org.mockito.{Mock, MockitoAnnotations}
@@ -34,7 +36,8 @@ import org.apache.spark.executor.{ShuffleWriteMetrics, TaskMetrics}
 import org.apache.spark.internal.config
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.network.shuffle.checksum.ShuffleChecksumHelper
-import org.apache.spark.serializer.{JavaSerializer, SerializerInstance, SerializerManager}
+import org.apache.spark.network.util.LimitedInputStream
+import org.apache.spark.serializer.{DeserializationStream, DirectRecordSerialization, JavaSerializer, SerializationStream, Serializer, SerializerInstance, SerializerManager}
 import org.apache.spark.shuffle.{IndexShuffleBlockResolver, ShuffleChecksumTestHelper}
 import org.apache.spark.shuffle.api.ShuffleExecutorComponents
 import org.apache.spark.shuffle.sort.io.LocalDiskShuffleExecutorComponents
@@ -206,6 +209,54 @@ class BypassMergeSortShuffleWriterSuite
     }
   }
 
+  Seq(16, 64, 1024).foreach { stagingSize =>
+    test(s"stage the records of a direct record serializer - staging size $stagingSize") {
+      val stagingConf = conf.clone
+        .set(config.SHUFFLE_SORT_BYPASS_MERGE_STAGING_SIZE.key, stagingSize.toString)
+      val serializer = new PaddedIntPairSerializer
+      when(dependency.serializer).thenReturn(serializer)
+      // Records take 8 to 104 bytes, so some do not fit a slot and some slots fill up.
+      val rand = new Random(42)
+      val records = Seq.fill(50000)((rand.nextInt(1000), rand.nextInt(1 << 20))) ++
+        Seq.fill(100)((3, 96))
+      val writer = new BypassMergeSortShuffleWriter[Int, Int](
+        blockManager,
+        shuffleHandle,
+        0L, // MapId
+        stagingConf,
+        taskContext.taskMetrics().shuffleWriteMetrics,
+        shuffleExecutorComponents)
+      writer.write(records.iterator)
+      writer.stop( /* success = */ true)
+
+      val partitioner = new HashPartitioner(7)
+      val manager = new SerializerManager(serializer, conf)
+      var offset = 0L
+      writer.getPartitionLengths.zipWithIndex.foreach { case (length, p) =>
+        val expected = records.filter(r => partitioner.getPartition(r._1) == p)
+        val in = new FileInputStream(outputFile)
+        try {
+          in.skipNBytes(offset)
+          val read = if (length == 0) Nil else {
+            serializer.newInstance()
+              .deserializeStream(manager.wrapStream(
+                ShuffleBlockId(0, 0, p), new LimitedInputStream(in, length)))
+              .asKeyValueIterator.map { case (k, v) => (k.asInstanceOf[Int], v.asInstanceOf[Int]) }
+              .toList
+          }
+          assert(read === expected, s"partition $p")
+        } finally {
+          in.close()
+        }
+        offset += length
+      }
+      assert(offset === outputFile.length())
+      val shuffleWriteMetrics = taskContext.taskMetrics().shuffleWriteMetrics
+      assert(shuffleWriteMetrics.bytesWritten === outputFile.length())
+      assert(shuffleWriteMetrics.recordsWritten === records.length)
+    }
+  }
+
   test("only generate temp shuffle file for non-empty partition") {
     // Using exception to test whether only non-empty partition creates temp shuffle file,
     // because temp shuffle file will only be cleaned after calling stop(false) in the failure
@@ -346,4 +397,76 @@ class BypassMergeSortShuffleWriterSuite
       }
     }
   }
+}
+
+/**
+ * Serializes (Int, Int) records as the key, the value and `value % 97` padding bytes, both through
+ * a stream and with [[DirectRecordSerialization]].
+ */
+private class PaddedIntPairSerializer extends Serializer with Serializable {
+  override def newInstance(): SerializerInstance = new PaddedIntPairSerializerInstance
+}
+
+private class PaddedIntPairSerializerInstance
+  extends SerializerInstance with DirectRecordSerialization {
+
+  private def padding(value: Any): Int = value.asInstanceOf[Int] % 97
+
+  override def serializeRecord(
+      key: Any, value: Any, buf: Array[Byte], offset: Int, limit: Int): Int = {
+    val size = serializedRecordSize(key, value)
+    if (size > limit - offset) {
+      -1
+    } else {
+      ByteBuffer.wrap(buf, offset, size)
+        .putInt(key.asInstanceOf[Int])
+        .putInt(value.asInstanceOf[Int])
+        .put(new Array[Byte](padding(value)))
+      size
+    }
+  }
+
+  override def serializedRecordSize(key: Any, value: Any): Int = 8 + padding(value)
+
+  override def serializeStream(s: OutputStream): SerializationStream = new SerializationStream {
+    private val out = new DataOutputStream(s)
+    override def writeKey[T: ClassTag](key: T): SerializationStream = {
+      out.writeInt(key.asInstanceOf[Int])
+      this
+    }
+    override def writeValue[T: ClassTag](value: T): SerializationStream = {
+      out.writeInt(value.asInstanceOf[Int])
+      out.write(new Array[Byte](padding(value)))
+      this
+    }
+    override def writeObject[T: ClassTag](t: T): SerializationStream =
+      throw new UnsupportedOperationException
+    override def flush(): Unit = out.flush()
+    override def close(): Unit = out.close()
+  }
+
+  override def deserializeStream(s: InputStream): DeserializationStream = new DeserializationStream {
+    private val in = new DataInputStream(s)
+    override def asKeyValueIterator: Iterator[(Any, Any)] = new Iterator[(Any, Any)] {
+      private var nextKey: Option[Int] = readKey()
+      private def readKey(): Option[Int] =
+        try Some(in.readInt()) catch { case _: EOFException => None }
+      override def hasNext: Boolean = nextKey.isDefined
+      override def next(): (Any, Any) = {
+        val value = in.readInt()
+        in.skipNBytes(padding(value))
+        val record = (nextKey.get, value)
+        nextKey = readKey()
+        record
+      }
+    }
+    override def readObject[T: ClassTag](): T = throw new UnsupportedOperationException
+    override def close(): Unit = in.close()
+  }
+
+  override def serialize[T: ClassTag](t: T): ByteBuffer = throw new UnsupportedOperationException
+  override def deserialize[T: ClassTag](bytes: ByteBuffer): T =
+    throw new UnsupportedOperationException
+  override def deserialize[T: ClassTag](bytes: ByteBuffer, loader: ClassLoader): T =
+    throw new UnsupportedOperationException
 }

@@ -25,6 +25,7 @@ import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.Tests.TEST_MEMORY
 import org.apache.spark.memory.TaskMemoryManager
 import org.apache.spark.rdd.RDD
+import org.apache.spark.serializer.DirectRecordSerialization
 import org.apache.spark.shuffle.sort.io.LocalDiskShuffleExecutorComponents
 import org.apache.spark.sql.{LocalSparkSession, Row, SparkSession}
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
@@ -87,6 +88,30 @@ class UnsafeRowSerializerSuite extends SparkFunSuite with LocalSparkSession {
     }
     assert(!deserializerIter.hasNext)
     assert(input.closed)
+  }
+
+  test("direct record serialization writes the bytes of the serialization stream") {
+    val rows = Seq(Row("Hello", 1), Row("a longer string of the second row", 2), Row(null, 3))
+    val unsafeRows = rows.map(row => toUnsafeRow(row, Array(StringType, IntegerType)))
+    val serializer = new UnsafeRowSerializer(numFields = 2).newInstance()
+    val baos = new ByteArrayOutputStream()
+    val serializerStream = serializer.serializeStream(baos)
+    for (unsafeRow <- unsafeRows) {
+      serializerStream.writeKey(0)
+      serializerStream.writeValue(unsafeRow)
+    }
+    serializerStream.close()
+
+    val direct = serializer.asInstanceOf[DirectRecordSerialization]
+    val buf = new Array[Byte](baos.size() + 8)
+    var offset = 0
+    for (unsafeRow <- unsafeRows) {
+      val size = direct.serializedRecordSize(0, unsafeRow)
+      assert(direct.serializeRecord(0, unsafeRow, buf, offset, offset + size - 1) === -1)
+      assert(direct.serializeRecord(0, unsafeRow, buf, offset, buf.length) === size)
+      offset += size
+    }
+    assert(buf.take(offset) === baos.toByteArray)
   }
 
   test("close empty input stream") {

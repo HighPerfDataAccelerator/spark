@@ -1756,6 +1756,19 @@ package object config {
       .intConf
       .createWithDefault(200)
 
+  private[spark] val SHUFFLE_SORT_BYPASS_MERGE_STAGING_SIZE =
+    ConfigBuilder("spark.shuffle.sort.bypassMergeStagingSize")
+      .internal()
+      .doc("When the serializer can serialize records into a byte array, the bypass-merge-sort " +
+        "shuffle writer stages each partition's serialized records in a slot of this many bytes " +
+        "of one array per task, and passes a slot to the partition's file writer when it is " +
+        "full. 0 writes every record through the partition's serialization stream.")
+      .version("4.2.1")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(v => v >= 0 && v <= ByteUnit.MiB.toBytes(1),
+        "The staging size must be between 0 and 1 MiB.")
+      .createWithDefaultString("1k")
+
   private[spark] val SHUFFLE_MANAGER =
     ConfigBuilder("spark.shuffle.manager")
       .version("1.1.0")

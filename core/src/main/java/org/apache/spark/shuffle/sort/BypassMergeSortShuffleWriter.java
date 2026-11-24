@@ -52,6 +52,7 @@ import org.apache.spark.shuffle.checksum.ShuffleChecksumSupport;
 import org.apache.spark.internal.config.package$;
 import org.apache.spark.scheduler.MapStatus;
 import org.apache.spark.scheduler.MapStatus$;
+import org.apache.spark.serializer.DirectRecordSerialization;
 import org.apache.spark.serializer.Serializer;
 import org.apache.spark.serializer.SerializerInstance;
 import org.apache.spark.shuffle.checksum.RowBasedChecksum;
@@ -89,6 +90,8 @@ final class BypassMergeSortShuffleWriter<K, V>
     SparkLoggerFactory.getLogger(BypassMergeSortShuffleWriter.class);
 
   private final int fileBufferSize;
+  /** Bytes of the staging array per partition (see {@link #writeStaged}); 0 disables staging. */
+  private final int stagingSize;
   private final boolean transferToEnabled;
   private final int numPartitions;
   private final BlockManager blockManager;
@@ -130,6 +133,8 @@ final class BypassMergeSortShuffleWriter<K, V>
       ShuffleExecutorComponents shuffleExecutorComponents) throws SparkException {
     // Use getSizeAsKb (not bytes) to maintain backwards compatibility if no units are provided
     this.fileBufferSize = (int) (long) conf.get(package$.MODULE$.SHUFFLE_FILE_BUFFER_SIZE()) * 1024;
+    this.stagingSize =
+      (int) (long) conf.get(package$.MODULE$.SHUFFLE_SORT_BYPASS_MERGE_STAGING_SIZE());
     this.transferToEnabled = (boolean) conf.get(package$.MODULE$.SHUFFLE_MERGE_PREFER_NIO());
     this.blockManager = blockManager;
     final ShuffleDependency<K, V, V> dep = handle.dependency();
@@ -178,13 +183,18 @@ final class BypassMergeSortShuffleWriter<K, V>
       // included in the shuffle write time.
       writeMetrics.incWriteTime(System.nanoTime() - openStartTime);
 
-      while (records.hasNext()) {
-        final Product2<K, V> record = records.next();
-        final K key = record._1();
-        final int partitionId = partitioner.getPartition(key);
-        partitionWriters[partitionId].write(key, record._2());
-        if (rowBasedChecksums.length > 0) {
-          rowBasedChecksums[partitionId].update(key, record._2());
+      if (stagingSize > 0 && serInstance instanceof DirectRecordSerialization direct &&
+          (long) stagingSize * numPartitions <= MAX_STAGING_BYTES) {
+        writeStaged(records, direct);
+      } else {
+        while (records.hasNext()) {
+          final Product2<K, V> record = records.next();
+          final K key = record._1();
+          final int partitionId = partitioner.getPartition(key);
+          partitionWriters[partitionId].write(key, record._2());
+          if (rowBasedChecksums.length > 0) {
+            rowBasedChecksums[partitionId].update(key, record._2());
+          }
         }
       }
 
@@ -222,6 +232,65 @@ final class BypassMergeSortShuffleWriter<K, V>
   @VisibleForTesting
   long getAggregatedChecksumValue() {
     return RowBasedChecksum.getAggregatedChecksumValue(rowBasedChecksums);
+  }
+
+  /** Upper bound of the staging array of {@link #writeStaged}, per task. */
+  private static final long MAX_STAGING_BYTES = 4L << 20;
+
+  /**
+   * Writes the records through a staging array: each partition owns a slot of
+   * {@code stagingSize} bytes, records are serialized into their partition's slot, and a full
+   * slot is passed to the partition's writer as raw bytes (records that do not fit a slot are
+   * passed on their own). Writing every record through its partition's serialization stream
+   * touches that partition's writer, stream and buffer objects, which with many partitions do
+   * not stay in the cache; the slots keep the per-record work to one array.
+   */
+  private void writeStaged(
+      Iterator<Product2<K, V>> records,
+      DirectRecordSerialization direct) throws IOException {
+    final int slot = stagingSize;
+    final byte[] staging = new byte[slot * numPartitions];
+    final int[] used = new int[numPartitions];
+    final int[] staged = new int[numPartitions];
+    while (records.hasNext()) {
+      final Product2<K, V> record = records.next();
+      final K key = record._1();
+      final V value = record._2();
+      final int partitionId = partitioner.getPartition(key);
+      final int start = partitionId * slot;
+      int n = direct.serializeRecord(key, value, staging, start + used[partitionId], start + slot);
+      if (n < 0) {
+        flushStaged(staging, used, staged, partitionId);
+        n = direct.serializeRecord(key, value, staging, start, start + slot);
+      }
+      if (n >= 0) {
+        used[partitionId] += n;
+        staged[partitionId]++;
+      } else {
+        // Larger than a slot: write it on its own, after the partition's staged records.
+        final byte[] bytes = new byte[direct.serializedRecordSize(key, value)];
+        direct.serializeRecord(key, value, bytes, 0, bytes.length);
+        partitionWriters[partitionId].write(bytes, 0, bytes.length);
+        partitionWriters[partitionId].recordWritten();
+      }
+      if (rowBasedChecksums.length > 0) {
+        rowBasedChecksums[partitionId].update(key, value);
+      }
+    }
+    for (int i = 0; i < numPartitions; i++) {
+      flushStaged(staging, used, staged, i);
+    }
+  }
+
+  private void flushStaged(byte[] staging, int[] used, int[] staged, int partitionId)
+      throws IOException {
+    if (staged[partitionId] > 0) {
+      final DiskBlockObjectWriter writer = partitionWriters[partitionId];
+      writer.write(staging, partitionId * stagingSize, used[partitionId]);
+      writer.recordsWritten(staged[partitionId]);
+      used[partitionId] = 0;
+      staged[partitionId] = 0;
+    }
   }
 
   /**
