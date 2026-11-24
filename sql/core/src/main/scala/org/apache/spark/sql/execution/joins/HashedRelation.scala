@@ -220,7 +220,28 @@ private[joins] class UnsafeHashedRelation(
     new UnsafeHashedRelation(numKeys, numFields, binaryMap)
   }
 
-  override def estimatedSize: Long = binaryMap.getTotalMemoryConsumption
+  @transient private var filterBytes = 0L
+  @transient private lazy val readOnlyFilter = {
+    val bits = binaryMap.buildReadOnlyProbeFilter()
+    if (bits != null) filterBytes = 8L * bits.length
+    bits
+  }
+
+  def asFilteredReadOnlyCopy(): UnsafeHashedRelation = {
+    val bits = readOnlyFilter
+    if (bits == null) return asReadOnlyCopy()
+    new UnsafeHashedRelation(numKeys, numFields, binaryMap) {
+      override def estimatedSize: Long = super.estimatedSize + 8L * bits.length
+
+      override def getValue(key: InternalRow): InternalRow = {
+        val row = key.asInstanceOf[UnsafeRow]
+        val hash = row.hashCode()
+        if (BytesToBytesMap.mightContainHash(bits, hash)) getValueWithHash(row, hash) else null
+      }
+    }
+  }
+
+  override def estimatedSize: Long = binaryMap.getTotalMemoryConsumption + filterBytes
 
   // re-used in get()/getValue()/getWithKeyIndex()/getValueWithKeyIndex()/valuesWithKeyIndex()
   var resultRow = new UnsafeRow(numFields)
@@ -251,10 +272,14 @@ private[joins] class UnsafeHashedRelation(
 
   def getValue(key: InternalRow): InternalRow = {
     val unsafeKey = key.asInstanceOf[UnsafeRow]
+    getValueWithHash(unsafeKey, unsafeKey.hashCode())
+  }
+
+  protected def getValueWithHash(unsafeKey: UnsafeRow, hash: Int): InternalRow = {
     val map = binaryMap  // avoid the compiler error
     val loc = new map.Location  // this could be allocated in stack
     binaryMap.safeLookup(unsafeKey.getBaseObject, unsafeKey.getBaseOffset,
-      unsafeKey.getSizeInBytes, loc, unsafeKey.hashCode())
+      unsafeKey.getSizeInBytes, loc, hash)
     if (loc.isDefined) {
       resultRow.pointTo(loc.getValueBase, loc.getValueOffset, loc.getValueLength)
       resultRow
