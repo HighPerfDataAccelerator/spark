@@ -681,7 +681,9 @@ case class HashAggregateExec(
     val beforeAgg = ctx.freshName("beforeAgg")
     if (partialPassThrough) {
       // The child's rows are consumed in several calls when pass-through rows are output: each
-      // such row ends the call, and the next call continues with the child's next row.
+      // such row ends the call, and the next call continues with the child's next row. Only the
+      // calls before pass-through starts are timed (System.nanoTime per row would cost more than
+      // the row itself).
       val aggTimeNs = ctx.addMutableState(CodeGenerator.JAVA_LONG, "aggTimeNs",
         forceInline = true)
       s"""
@@ -694,9 +696,14 @@ case class HashAggregateExec(
          |    $passThroughEmptyTerm = ((UnsafeRow) $thisPlan.getEmptyAggregationBuffer()).copy();
          |    $passThroughBufferTerm = $passThroughEmptyTerm.copy();
          |  }
-         |  long $beforeAgg = System.nanoTime();
-         |  $doAggFuncName(partitionIndex);
-         |  $aggTimeNs += System.nanoTime() - $beforeAgg;
+         |  if ($passThroughTerm) {
+         |    // Not timed: this call returns after each pass-through row, and the map is not built.
+         |    $doAggFuncName(partitionIndex);
+         |  } else {
+         |    long $beforeAgg = System.nanoTime();
+         |    $doAggFuncName(partitionIndex);
+         |    $aggTimeNs += System.nanoTime() - $beforeAgg;
+         |  }
          |  if (!$aggInputDone) return;
          |  $aggTime.add($aggTimeNs / $NANOS_PER_MILLIS);
          |}
