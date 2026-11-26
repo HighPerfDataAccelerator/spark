@@ -189,6 +189,10 @@ class RowBasedHashMapGenerator(
        |public org.apache.spark.unsafe.KVIterator<UnsafeRow, UnsafeRow> rowIterator() {
        |  return batch.rowIterator();
        |}
+       |
+       |public int numKeys() {
+       |  return numRows;
+       |}
      """.stripMargin
   }
 }
