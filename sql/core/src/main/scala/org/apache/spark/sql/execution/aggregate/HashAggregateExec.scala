@@ -167,6 +167,37 @@ case class HashAggregateExec(
   // Code that processes the rows still in a batch, run after the child's last row.
   private var flushPrefetchBatches: String = ""
 
+  // A partial aggregate over a key that hardly repeats within a task keeps almost one map entry
+  // per input row: it reduces little, and once the map outgrows the cache every row costs a
+  // cache miss. When the map holds at least `passThroughMinRatio` keys per input row after
+  // `passThroughMinRows` input rows (checked again each time the row count doubles), every
+  // further input row is output at once as its own partial aggregate (its key and the buffer
+  // updated from the initial values with that row), without the map. The keys already in the map
+  // are output after the last input row. 0 rows disables this.
+  private lazy val passThroughMinRows =
+    conf.getConfString("spark.sql.aggregate.partialPassThrough.minRows", "65536").toLong
+  private lazy val passThroughMinRatio =
+    conf.getConfString("spark.sql.aggregate.partialPassThrough.minRatio", "0.9").toDouble
+  private lazy val partialPassThrough: Boolean = passThroughMinRows > 0 &&
+    groupingExpressions.nonEmpty && aggregateExpressions.nonEmpty &&
+    aggregateExpressions.forall(_.mode == Partial) && testFallbackStartsAt.isEmpty
+
+  // Pass-through rows are output while the child's rows are consumed, so the child has to stop
+  // after an output row, and to copy rows if it can produce several before it checks.
+  override def needStopCheck: Boolean = partialPassThrough
+
+  override def needCopyResult: Boolean =
+    partialPassThrough && child.asInstanceOf[CodegenSupport].needCopyResult
+
+  // Names of the pass-through state, set in doProduceWithKeys for doConsumeWithKeys.
+  private var passThroughTerm: String = _
+  private var passThroughRowsTerm: String = _
+  private var passThroughNextCheckTerm: String = _
+  private var passThroughKeyTerm: String = _
+  private var passThroughBufferTerm: String = _
+  private var passThroughEmptyTerm: String = _
+  private var passThroughOutputFunc: String = _
+
   /**
    * This is called by generated Java class, should be public.
    */
@@ -523,6 +554,24 @@ case class HashAggregateExec(
       forceInline = true)
 
     val doAgg = ctx.freshName("doAggregateWithKeys")
+    val aggInputDone = if (partialPassThrough) {
+      passThroughTerm = ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "passThrough",
+        forceInline = true)
+      passThroughRowsTerm = ctx.addMutableState(CodeGenerator.JAVA_LONG, "passThroughRows",
+        forceInline = true)
+      passThroughNextCheckTerm = ctx.addMutableState(CodeGenerator.JAVA_LONG,
+        "passThroughNextCheck", v => s"$v = ${passThroughMinRows}L;", forceInline = true)
+      passThroughKeyTerm = ctx.addMutableState("UnsafeRow", "passThroughKey", forceInline = true)
+      passThroughBufferTerm = ctx.addMutableState("UnsafeRow", "passThroughBuffer",
+        forceInline = true)
+      passThroughEmptyTerm = ctx.addMutableState("UnsafeRow", "passThroughEmpty",
+        forceInline = true)
+      // The consume code of the child calls the output function for pass-through rows.
+      passThroughOutputFunc = generateResultFunction(ctx)
+      ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "aggInputDone", forceInline = true)
+    } else {
+      null
+    }
     val peakMemory = metricTerm(ctx, "peakMemory")
     val spillSize = metricTerm(ctx, "spillSize")
     val avgHashProbe = metricTerm(ctx, "avgHashProbe")
@@ -549,6 +598,7 @@ case class HashAggregateExec(
       s"""
          |private void $doAgg(int partitionIndex) throws java.io.IOException {
          |  ${child.asInstanceOf[CodegenSupport].produce(ctx, this)}
+         |  ${if (aggInputDone != null) s"$aggInputDone = true;" else ""}
          |  $flushPrefetchBatches
          |  $finishHashMap
          |}
@@ -557,7 +607,8 @@ case class HashAggregateExec(
     // generate code for output
     val keyTerm = ctx.freshName("aggKey")
     val bufferTerm = ctx.freshName("aggBuffer")
-    val outputFunc = generateResultFunction(ctx)
+    val outputFunc =
+      if (partialPassThrough) passThroughOutputFunc else generateResultFunction(ctx)
 
     val limitNotReachedCondition = limitNotReachedCond
 
@@ -628,20 +679,47 @@ case class HashAggregateExec(
 
     val aggTime = metricTerm(ctx, "aggTime")
     val beforeAgg = ctx.freshName("beforeAgg")
-    s"""
-       |if (!$initAgg) {
-       |  $initAgg = true;
-       |  $createFastHashMap
-       |  $addHookToCloseFastHashMap
-       |  $hashMapTerm = $thisPlan.createHashMap();
-       |  long $beforeAgg = System.nanoTime();
-       |  $doAggFuncName(partitionIndex);
-       |  $aggTime.add((System.nanoTime() - $beforeAgg) / $NANOS_PER_MILLIS);
-       |}
-       |// output the result
-       |$outputFromFastHashMap
-       |$outputFromRegularHashMap
-     """.stripMargin
+    if (partialPassThrough) {
+      // The child's rows are consumed in several calls when pass-through rows are output: each
+      // such row ends the call, and the next call continues with the child's next row.
+      val aggTimeNs = ctx.addMutableState(CodeGenerator.JAVA_LONG, "aggTimeNs",
+        forceInline = true)
+      s"""
+         |if (!$aggInputDone) {
+         |  if (!$initAgg) {
+         |    $initAgg = true;
+         |    $createFastHashMap
+         |    $addHookToCloseFastHashMap
+         |    $hashMapTerm = $thisPlan.createHashMap();
+         |    $passThroughEmptyTerm = ((UnsafeRow) $thisPlan.getEmptyAggregationBuffer()).copy();
+         |    $passThroughBufferTerm = $passThroughEmptyTerm.copy();
+         |  }
+         |  long $beforeAgg = System.nanoTime();
+         |  $doAggFuncName(partitionIndex);
+         |  $aggTimeNs += System.nanoTime() - $beforeAgg;
+         |  if (!$aggInputDone) return;
+         |  $aggTime.add($aggTimeNs / $NANOS_PER_MILLIS);
+         |}
+         |// output the result
+         |$outputFromFastHashMap
+         |$outputFromRegularHashMap
+       """.stripMargin
+    } else {
+      s"""
+         |if (!$initAgg) {
+         |  $initAgg = true;
+         |  $createFastHashMap
+         |  $addHookToCloseFastHashMap
+         |  $hashMapTerm = $thisPlan.createHashMap();
+         |  long $beforeAgg = System.nanoTime();
+         |  $doAggFuncName(partitionIndex);
+         |  $aggTime.add((System.nanoTime() - $beforeAgg) / $NANOS_PER_MILLIS);
+         |}
+         |// output the result
+         |$outputFromFastHashMap
+         |$outputFromRegularHashMap
+       """.stripMargin
+    }
   }
 
   protected override def doConsumeWithKeys(ctx: CodegenContext, input: Seq[ExprCode]): String = {
@@ -891,13 +969,53 @@ case class HashAggregateExec(
     // hash map will return null for new key), we spill the hash map to disk to free memory, then
     // continue to do in-memory aggregation and spilling until all the rows had been processed.
     // Finally, sort the spilled aggregate buffers by key, and merge them together for same key.
-    if (!batchLookups) {
+    // Pass-through (see `passThroughMinRows`): a local copy of the flag, as the row count check
+    // can set it for the next row.
+    val passThroughNow = ctx.freshName("passThroughNow")
+    def withPassThrough(mapPath: String, update: String): String = if (!partialPassThrough) {
       s"""
          |$declareRowBuffer
-         |$findOrInsertHashMap
-         |$incCounter
-         |$updateRowInHashMap
+         |$mapPath
+         |$update
        """.stripMargin
+    } else {
+      val fastMapKeys = if (isFastHashMapEnabled && !isVectorizedHashMapEnabled) {
+        s" + $fastHashMapTerm.numKeys()"
+      } else {
+        ""
+      }
+      s"""
+         |$declareRowBuffer
+         |boolean $passThroughNow = $passThroughTerm;
+         |if ($passThroughNow) {
+         |  ${unsafeRowKeyCode.code}
+         |  $passThroughKeyTerm = $unsafeRowKeys;
+         |  $passThroughBufferTerm.copyFrom($passThroughEmptyTerm);
+         |  $unsafeRowBuffer = $passThroughBufferTerm;
+         |} else {
+         |  $mapPath
+         |  if (++$passThroughRowsTerm == $passThroughNextCheckTerm) {
+         |    $passThroughNextCheckTerm <<= 1;
+         |    if ($hashMapTerm.getNumKeys()$fastMapKeys >=
+         |        ${passThroughMinRatio}D * $passThroughRowsTerm) {
+         |      $passThroughTerm = true;
+         |    }
+         |  }
+         |}
+         |$update
+         |if ($passThroughNow) {
+         |  $passThroughOutputFunc($passThroughKeyTerm, $passThroughBufferTerm);
+         |}
+       """.stripMargin
+    }
+
+    if (!batchLookups) {
+      withPassThrough(
+        s"""
+           |$findOrInsertHashMap
+           |$incCounter
+         """.stripMargin,
+        updateRowInHashMap)
     } else {
       // Batched regular hash map lookups. A row that misses the fast hash map is queued with a
       // copy of its grouping key and of the input columns read by the aggregate functions (and
@@ -1011,13 +1129,13 @@ case class HashAggregateExec(
         enqueueOrLookup
       }
       // `unsafeRowBuffer` is null if the row was queued.
-      s"""
-         |$declareRowBuffer
-         |$findOrEnqueue
-         |if ($unsafeRowBuffer != null) {
-         |  $updateRowInRegularHashMap
-         |}
-       """.stripMargin
+      withPassThrough(
+        findOrEnqueue,
+        s"""
+           |if ($unsafeRowBuffer != null) {
+           |  $updateRowInRegularHashMap
+           |}
+         """.stripMargin)
     }
   }
 
