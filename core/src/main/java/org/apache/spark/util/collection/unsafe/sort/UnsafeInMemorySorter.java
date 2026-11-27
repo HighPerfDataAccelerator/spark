@@ -50,7 +50,25 @@ public final class UnsafeInMemorySorter {
    * instructions ({@link Platform#PREFETCH_SUPPORTED}).
    */
   public static final int PREFETCH_BATCH =
-    Platform.PREFETCH_SUPPORTED ? Integer.getInteger("unsafe.sort.prefetchBatch", 16) : 0;
+    Platform.PREFETCH_SUPPORTED ? Integer.getInteger("unsafe.sort.prefetchBatch", 32) : 0;
+
+  /**
+   * How many 64-byte lines of each record to prefetch, from the record's start (JVM system
+   * property {@code unsafe.sort.prefetchLines}, default 2). Records are not line-aligned, so most
+   * span two lines. On NVIDIA Vera (and likely other cores), a load that misses makes the
+   * hardware prefetch the neighboring lines as well, but a prefetch instruction does not: with
+   * one line per record, the record's second line misses later, once per record.
+   */
+  public static final int PREFETCH_LINES =
+    Math.max(1, Integer.getInteger("unsafe.sort.prefetchLines", 2));
+
+  /** Prefetches the first {@link #PREFETCH_LINES} lines of a record. */
+  public static void prefetchRecord(Object page, long offsetInPage) {
+    Platform.prefetchRead(page, offsetInPage);
+    for (int line = 1; line < PREFETCH_LINES; line++) {
+      Platform.prefetchRead(page, offsetInPage + 64L * line);
+    }
+  }
 
   private static final class SortComparator implements Comparator<RecordPointerAndKeyPrefix> {
 
@@ -282,28 +300,36 @@ public final class UnsafeInMemorySorter {
     private int recordLength;
     private long currentPageNumber;
     private final TaskContext taskContext = TaskContext.get();
-    /**
-     * Array position (like `position`) of the next record to prefetch; 0 until the first
-     * loadNext(), which prefetches the first PREFETCH_BATCH + 1 records.
-     */
-    private int prefetchPosition;
 
     private SortedIterator(int numRecords, int offset) {
+      this(numRecords, offset, true);
+    }
+
+    /**
+     * @param prefetch whether to prefetch the first PREFETCH_BATCH records; each loadNext() then
+     *                 prefetches the record PREFETCH_BATCH positions after the one it returns
+     */
+    private SortedIterator(int numRecords, int offset, boolean prefetch) {
       this.numRecords = numRecords;
       this.position = 0;
       this.offset = offset;
+      if (prefetch && PREFETCH_BATCH > 0) {
+        final int end = 2 * Math.min(PREFETCH_BATCH, numRecords);
+        for (int i = 0; i < end; i += 2) {
+          prefetchRecordAt(i);
+        }
+      }
     }
 
     @Override
     public SortedIterator clone() {
-      SortedIterator iter = new SortedIterator(numRecords, offset);
+      SortedIterator iter = new SortedIterator(numRecords, offset, false);
       iter.position = position;
       iter.baseObject = baseObject;
       iter.baseOffset = baseOffset;
       iter.keyPrefix = keyPrefix;
       iter.recordLength = recordLength;
       iter.currentPageNumber = currentPageNumber;
-      iter.prefetchPosition = prefetchPosition;
       return iter;
     }
 
@@ -327,19 +353,13 @@ public final class UnsafeInMemorySorter {
       if (taskContext != null) {
         taskContext.killTaskIfInterrupted();
       }
-      // Keep a prefetch in flight for each of the next PREFETCH_BATCH records: this one and the
-      // next PREFETCH_BATCH on the first call, and then, on each call, the one PREFETCH_BATCH
-      // records after this one.
+      // Keep a prefetch in flight for each of the next PREFETCH_BATCH records: the first ones
+      // were prefetched when the iterator was created; prefetch the one PREFETCH_BATCH records
+      // after this one.
       if (PREFETCH_BATCH > 0) {
-        if (prefetchPosition == 0) {
-          final int end = Math.min(2 * PREFETCH_BATCH + 2, 2 * numRecords);
-          for (int i = 0; i < end; i += 2) {
-            prefetchRecord(i);
-          }
-          prefetchPosition = end;
-        } else if (prefetchPosition < 2 * numRecords) {
-          prefetchRecord(prefetchPosition);
-          prefetchPosition += 2;
+        final int ahead = position + 2 * PREFETCH_BATCH;
+        if (ahead < 2 * numRecords) {
+          prefetchRecordAt(ahead);
         }
       }
       // This pointer points to a 4-byte record length, followed by the record's bytes
@@ -354,10 +374,10 @@ public final class UnsafeInMemorySorter {
       position += 2;
     }
 
-    /** Prefetches the start of the record at the given array position (like `position`). */
-    private void prefetchRecord(int pos) {
+    /** Prefetches the record at the given array position (like `position`). */
+    private void prefetchRecordAt(int pos) {
       final long p = array.get(offset + pos);
-      Platform.prefetchRead(memoryManager.getPage(p), memoryManager.getOffsetInPage(p));
+      prefetchRecord(memoryManager.getPage(p), memoryManager.getOffsetInPage(p));
     }
 
     @Override

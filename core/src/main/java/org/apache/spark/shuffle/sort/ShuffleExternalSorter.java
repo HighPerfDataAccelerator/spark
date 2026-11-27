@@ -309,10 +309,11 @@ final class ShuffleExternalSorter extends MemoryConsumer implements ShuffleCheck
     }
   }
 
-  /** Prefetches the start of the record that a packed record pointer points to. */
+  /** Prefetches the record that a packed record pointer points to. */
   private void prefetchRecord(long packedRecordPointer) {
     final long p = PackedRecordPointer.decodeRecordPointer(packedRecordPointer);
-    Platform.prefetchRead(taskMemoryManager.getPage(p), taskMemoryManager.getOffsetInPage(p));
+    UnsafeInMemorySorter.prefetchRecord(
+      taskMemoryManager.getPage(p), taskMemoryManager.getOffsetInPage(p));
   }
 
   /**
